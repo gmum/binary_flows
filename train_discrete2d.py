@@ -363,7 +363,7 @@ class Workspace:
                                                                self.cfg.bits,
                                                                self.cfg.arbernoulli.conditional,
                                                                self.cfg.arbernoulli.conditional_classes,
-                                                               self.cfg.linear_codes)
+                                                               self.cfg.linear_codes).to(self.device)
             else:
                 raise ValueError(f"Unknown base option {self.cfg.base}")
 
@@ -388,7 +388,7 @@ class Workspace:
                                             pad=self.cfg.bf.pad,
                                             conditional=self.cfg.bf.conditional,
                                             conditional_classes=self.cfg.bf.conditional_classes,
-                                            log=log)
+                                            log=log).to(self.device)
             self.all_parameters = set(list(self.model.parameters()))
             # print(self.model)
         else:
