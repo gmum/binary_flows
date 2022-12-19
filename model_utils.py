@@ -21,6 +21,30 @@ import voronoi
 import argmax_utils
 
 
+def single_net(M, ks, pad, ch=1):
+    net = nn.Sequential(nn.Conv2d(ch, M, kernel_size=ks, padding=pad, stride=1),
+                        nn.GELU(),
+                        nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
+                        nn.GELU(),
+                        nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
+                        nn.GELU(),
+                        nn.Conv2d(M, 1, kernel_size=ks, padding=pad, stride=1),
+                        nn.Sigmoid(),)
+    return net
+
+
+def single_net_conditional(M, ks, pad, conditional_classes, ch=1):
+    net = nn.Sequential(nn.Conv2d(ch+conditional_classes, M, kernel_size=ks, padding=pad, stride=1),
+                        nn.GELU(),
+                        nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
+                        nn.GELU(),
+                        nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
+                        nn.GELU(),
+                        nn.Conv2d(M, 1, kernel_size=ks, padding=pad, stride=1),
+                        nn.Sigmoid(),)
+    return net
+
+
 def standard_normal_sample(size):
     return torch.randn(size)
 
@@ -96,6 +120,126 @@ def _logaddexp(a, b):
     return torch.log(torch.exp(a - m) + torch.exp(b - m)) + m
 
 
+class StepSigmoid(nn.Module):
+    def __init__(self, temp=1.e7):
+        super(StepSigmoid, self).__init__()
+
+        self.temp = temp
+
+    def forward(self, x):
+        return torch.sigmoid(x * self.temp)
+
+
+class SignSTE(nn.Module):
+    def __init__(self, threshold=1.):
+        super(SignSTE, self).__init__()
+        self.threshold = threshold
+
+    def forward(self, x):
+        y = F.hardtanh(x, -self.threshold, self.threshold)
+        return y + torch.sign(x + 1.e-7).detach() - y.detach()
+
+
+class StepSTE(nn.Module):
+    def __init__(self, threshold=1.):
+        super(StepSTE, self).__init__()
+        self.threshold = threshold
+
+    def forward(self, x):
+        y = F.hardtanh(x, -self.threshold, self.threshold)
+        return y + 0.5 * (torch.sign(x + 1.e-7).detach() + 1.) - y.detach()
+
+
+def create_binary_flows_nets(bits=8, architecture='cnn', M=32, ks=3, pad=1, linear_codes=False, conditional=False, conditional_classes=8):
+    if architecture == 'cnn':
+
+        net_a = lambda: nn.Sequential(nn.Conv2d(bits, M, kernel_size=ks, padding=pad, stride=1),
+                                      nn.GELU(),
+                                      nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
+                                      nn.GELU(),
+                                      nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
+                                      nn.GELU(),
+                                      nn.Conv2d(M, bits, kernel_size=1, padding=0, stride=1),
+                                      StepSTE(threshold=0.5))
+
+        net_b = lambda: nn.Sequential(nn.Conv2d(bits, M, kernel_size=ks, padding=pad, stride=1),
+                                      nn.GELU(),
+                                      nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
+                                      nn.GELU(),
+                                      nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
+                                      nn.GELU(),
+                                      nn.Conv2d(M, bits, kernel_size=1, padding=0, stride=1),
+                                      StepSTE(threshold=0.5))
+
+        net_a_no_linear_codes = lambda: nn.Sequential(nn.Conv2d(bits//2, M, kernel_size=ks, padding=pad, stride=1),
+                                                      nn.GELU(),
+                                                      nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
+                                                      nn.GELU(),
+                                                      nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
+                                                      nn.GELU(),
+                                                      nn.Conv2d(M, bits//2, kernel_size=1, padding=0, stride=1),
+                                                      StepSTE(threshold=0.5))
+
+        net_b_no_linear_codes = lambda: nn.Sequential(nn.Conv2d(bits//2, M, kernel_size=ks, padding=pad, stride=1),
+                                                      nn.GELU(),
+                                                      nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
+                                                      nn.GELU(),
+                                                      nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
+                                                      nn.GELU(),
+                                                      nn.Conv2d(M, bits//2, kernel_size=1, padding=0, stride=1),
+                                                      StepSTE(threshold=0.5))
+
+        #TODO!!! - create conditional_net_a and conditional_net_b
+        conditional_net_a = lambda: nn.Sequential(nn.Conv2d((bits//2) + conditional_classes, M, kernel_size=ks, padding=pad, stride=1),
+                                                  nn.GELU(),
+                                                  nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
+                                                  nn.GELU(),
+                                                  nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
+                                                  nn.GELU(),
+                                                  nn.Conv2d(M, bits//2, kernel_size=1, padding=0, stride=1),
+                                                  StepSTE(threshold=0.5))
+
+        conditional_net_b = lambda: nn.Sequential(nn.Conv2d((bits//2) + conditional_classes, M, kernel_size=ks, padding=pad, stride=1),
+                                                  nn.GELU(),
+                                                  nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
+                                                  nn.GELU(),
+                                                  nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
+                                                  nn.GELU(),
+                                                  nn.Conv2d(M, bits//2, kernel_size=1, padding=0, stride=1),
+                                                  StepSTE(threshold=0.5))
+
+        conditional_net_a_no_linear_codes = lambda: nn.Sequential(nn.Conv2d(bits+conditional_classes, M, kernel_size=ks, padding=pad, stride=1),
+                                                                  nn.GELU(),
+                                                                  nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
+                                                                  nn.GELU(),
+                                                                  nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
+                                                                  nn.GELU(),
+                                                                  nn.Conv2d(M, bits//2, kernel_size=1, padding=0, stride=1),
+                                                                  StepSTE(threshold=0.5))
+
+        conditional_net_b_no_linear_codes = lambda: nn.Sequential(nn.Conv2d(8+conditional_classes, M, kernel_size=ks, padding=pad, stride=1),
+                                                                  nn.GELU(),
+                                                                  nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
+                                                                  nn.GELU(),
+                                                                  nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
+                                                                  nn.GELU(),
+                                                                  nn.Conv2d(M, bits//2, kernel_size=1, padding=0, stride=1),
+                                                                  StepSTE(threshold=0.5))
+
+        if linear_codes:
+            if conditional == True:
+                nets = [conditional_net_a, conditional_net_b]
+            else:
+                nets = [net_a, net_b]
+        else:
+            if conditional == True:
+                nets = [conditional_net_a_no_linear_codes, conditional_net_b_no_linear_codes]
+            else:
+                nets = [net_a_no_linear_codes, net_b_no_linear_codes]
+
+    return nets
+
+
 class BaseGaussianDistribution(nn.Module):
     def __init__(self, d):
         super().__init__()
@@ -132,6 +276,84 @@ class ConditionalGaussianDistribution(nn.Module):
         z = torch.randn(num_samples, self.d, device=device)
         z = z * log_std.exp() + mean
         log_p = normal_logpdf(z, mean, log_std).sum(1, keepdim=True)
+        return z, log_p
+
+
+class SemiAutoregressiveBernoulliDistribution(nn.Module):
+    def __init__(self, img_shape, M=32, ks=3, pad=1, conditional=False, conditional_classes=8, linear_codes=False):
+        super().__init__()
+        self.img_shape = img_shape
+        self.M = M
+        self.ks = ks
+        self.pad = pad
+        self.conditional = conditional
+        self.conditional_classes = conditional_classes
+        self.linear_codes = linear_codes
+        linear_codes_size = 8 if self.linear_codes else 0
+        if self.conditional:
+            self.net_base = torch.nn.ModuleList([single_net_conditional(self.M, self.ks, self.pad, i+1) for i in range(self.conditional_classes - 1 + linear_codes_size)])
+        else:
+            self.net_base = torch.nn.ModuleList([single_net(self.M, self.ks, self.pad, i+1) for i in range(self.conditional_classes - 1 + linear_codes_size)])
+        # self.net = nn.Sequential(
+        #     nn.Linear(cond_embed_dim, 1024), actfns[actfn](), nn.Linear(1024, d * 2)
+        # )
+        means_shape = [1, *self.img_shape]
+        means_shape[1] = 1
+        lin_mean = torch.zeros(means_shape)
+        self.lin_mean = nn.Parameter(lin_mean)
+
+    def _log_base(self, x, context=None):
+        # TODO - check!!!
+        # calculate probs:
+        probs = torch.sigmoid(self.lin_mean)
+        ones = [1] * (len(self.img_shape))
+        probs = probs.repeat(x.shape[0], *ones)
+
+        if context is not None:
+            for i in range(len(self.net_base)):
+                partial_x = x[:, 0:i+1]
+                extended_context = context.repeat(1, 1, 2).reshape((context.shape[0], 4, 1, 2))
+                partial_x_with_context = torch.cat((partial_x, extended_context), 1)
+                p_i = self.net_base[i](partial_x_with_context)
+                probs = torch.cat((probs, p_i), 1)
+        else:
+            for i in range(len(self.net_base)):
+                p_i = self.net_base[i](x[:, 0:i+1])
+                probs = torch.cat((probs, p_i), 1)
+
+        probs = torch.clamp(probs, 1.e-7, 1. - 1.e-7)
+
+        log_p = x * torch.log(probs) + (1. - x) * torch.log(1. - probs)
+        sum_over = [i + 1 for i in range(len(x.shape) - 1)]  # all indices but the batch dimension
+        return log_p.sum(sum_over)
+
+    def forward(self, z, context=None, **kwargs):
+        # TODO - check if - or +
+        # -self._log_base(z, context).sum()
+        return self._log_base(z, context).sum()
+
+    def sample(self, num_samples, context=None, device="cpu", **kwargs):
+        # FIRST PLANE
+        # Calculating probabilities
+        probs = torch.sigmoid(self.lin_mean).to(device)
+        ones = [1] * (len(self.img_shape))
+        probs = probs.repeat(num_samples, *ones)
+        # Sampling from the base distribution
+        z = torch.bernoulli(probs).to(device)
+
+        if context is not None:
+            extended_context = context.repeat(1, 1, 2).reshape((context.shape[0], 4, 1, 2))
+            for i in range(len(self.net_base)):
+                z_with_context = torch.cat((z, extended_context), 1)
+                z_i = torch.bernoulli(self.net_base[i](z_with_context))
+                z = torch.cat((z, z_i), 1)
+        else:
+            # REMAINING PLANES
+            for i in range(len(self.net_base)):
+                z_i = torch.bernoulli(self.net_base[i](z))
+                z = torch.cat((z, z_i), 1)
+        # TODO - check!!!
+        log_p = z * torch.log(probs) + (1. - z) * torch.log(1. - probs)
         return z, log_p
 
 
@@ -330,6 +552,206 @@ class Reshape(nn.Module):
             return x
         else:
             return x, logp
+
+
+class BinaryFlow(nn.Module):
+    def __init__(self, nets, args):
+        super(BinaryFlow, self).__init__()
+
+        # parameterization
+        self.t_a = torch.nn.ModuleList([nets[0]() for _ in range(args.num_flows)])
+        self.t_b = torch.nn.ModuleList([nets[1]() for _ in range(args.num_flows)])
+
+        means_shape = [1, *args.img_shape]
+        means_shape[1] = args.bits * 2
+        lin_mean = torch.ones(means_shape) * 0.5
+        lin_mean[:, 0:args.bits] = -2.
+        lin_mean[:, args.bits:] = 2.
+        self.lin_mean = nn.Parameter(lin_mean)
+
+        # hyperparameters
+        self.args = args
+
+        self.sampling = True
+        self.reconstruction = False
+
+    @staticmethod
+    def xor(x, y):
+        return x + y - 2 * x * y
+
+    @staticmethod
+    def permute(x):
+        return x.flip(1)
+
+    # Flow-related functions
+    def coupling(self, x, index, forward=True):
+        # divide into two parts
+        (xa, xb) = torch.chunk(x, 2, dim=1)
+
+        # forward
+        if forward:
+            ya = self.xor(xa, self.t_a[index](xb))
+            yb = self.xor(xb, self.t_b[index](ya))
+        # inverse
+        else:
+            yb = self.xor(xb, self.t_b[index](xa))
+            ya = self.xor(xa, self.t_a[index](yb))
+
+        return torch.cat((ya, yb), 1)
+
+    def f(self, x):
+        z = x
+        for i in range(self.args.num_flows):
+            z = self.coupling(z, i, forward=True)
+            z = self.permute(z)
+        return z
+
+    def f_inv(self, z):
+        x = z
+        for i in reversed(range(self.args.num_flows)):
+            x = self.permute(x)
+            x = self.coupling(x, i, forward=False)
+        return x
+
+    # The base distribution
+    def log_base(self, x):
+        probs = torch.sigmoid(self.lin_mean)
+        log_p = x * torch.log(probs) + (1. - x) * torch.log(1. - probs)
+        sum_over = [i + 1 for i in range(len(x.shape) - 1)]  # all indices but the batch dimension
+        return log_p.sum(sum_over)
+
+    #TODO - add sampling with condition
+    def sample(self, batch_size=64, device='cpu'):
+        # Calculating probabilities
+        probs = torch.sigmoid(self.lin_mean).to(device)
+        ones = [1] * (len(self.args.img_shape))
+        probs = probs.repeat(batch_size, *ones)
+        # Sampling from the base distribution
+        z = torch.bernoulli(probs).to(device)
+        # Inverting the flow
+        x = self.f_inv(z).to(device)
+        return x
+
+    # FORWARD
+    def forward(self, x, y=None, reduction='avg'):
+        z = self.f(x)
+        if reduction == 'sum':
+            return -self.log_base(z).sum()
+        else:
+            return -self.log_base(z).mean()
+
+
+class BinaryFlowGroupARM(nn.Module):
+    def __init__(self, base_distribution, linear_codes=False, bits=8, architecture="cnn", num_flows=8, M=32, ks=3, pad=1, conditional=False, conditional_classes=8, log=None):
+        super(BinaryFlowGroupARM, self).__init__()
+
+        self.architecture = architecture
+        self.num_flows = num_flows
+        self.bits = bits
+        self.linear_codes = linear_codes
+        self.M = M
+        self.ks = ks
+        self.pad = pad
+        self.conditional = conditional
+        self.conditional_classes = conditional_classes
+
+        nets = create_binary_flows_nets(bits=self.bits, architecture=self.architecture, M=self.M, ks=self.ks, pad=self.pad, linear_codes=self.linear_codes, conditional=self.conditional, conditional_classes=self.conditional_classes)
+
+        # parameterization
+        self.t_a = torch.nn.ModuleList([nets[0]() for _ in range(self.num_flows)])
+        self.t_b = torch.nn.ModuleList([nets[1]() for _ in range(self.num_flows)])
+
+        # self.net_base = net_base
+        self.base_distribution = base_distribution
+
+        self.log = log
+
+    @staticmethod
+    def xor(x, y):
+        return x + y - 2 * x * y
+
+    @staticmethod
+    def permute(x):
+        return x.flip(1)
+
+    # Flow-related functions
+    def coupling(self, x, index, forward=True, context=None):
+        # divide into two parts
+        (xa, xb) = torch.chunk(x, 2, dim=1)
+
+        if context is not None:
+            extended_context = context.repeat(1, 1, 2).reshape((context.shape[0], 4, 1, 2))
+            context = extended_context
+            # forward
+            if forward:
+                xb_with_context = torch.cat((xb, context), 1)
+                # ya = self.xor(xa, self.t_a[index](xb, context))
+                ya = self.xor(xa, self.t_a[index](xb_with_context))
+                ya_with_context = torch.cat((ya, context), 1)
+                # yb = self.xor(xb, self.t_b[index](ya, context))
+                yb = self.xor(xb, self.t_b[index](ya_with_context))
+            # inverse
+            else:
+                xa_with_context = torch.cat((xa, context), 1)
+                # yb = self.xor(xb, self.t_b[index](xa, context))
+                yb = self.xor(xb, self.t_b[index](xa_with_context))
+                yb_with_context = torch.cat((yb, context), 1)
+                # ya = self.xor(xa, self.t_a[index](yb, context))
+                ya = self.xor(xa, self.t_a[index](yb_with_context))
+        else:
+            # forward
+            if forward:
+                ya = self.xor(xa, self.t_a[index](xb))
+                yb = self.xor(xb, self.t_b[index](ya))
+            # inverse
+            else:
+                yb = self.xor(xb, self.t_b[index](xa))
+                ya = self.xor(xa, self.t_a[index](yb))
+
+        return torch.cat((ya, yb), 1)
+
+    def f(self, x, context=None):
+        z = x
+        for i in range(self.num_flows):
+            #TODO - conditional version
+            z = self.coupling(z, i, forward=True, context=context)
+            z = self.permute(z)
+        return z
+
+    def f_inv(self, z, context=None):
+        x = z
+        for i in reversed(range(self.num_flows)):
+            x = self.permute(x)
+            #TODO - conditional version
+            x = self.coupling(x, i, forward=False, context=context)
+        return x
+
+    # The base distribution
+    def log_base(self, x, context=None):
+        # return log_p.sum(sum_over)
+        return self.base_distribution._log_base(x, context=context)
+
+    def sample(self, batch_size=64, device='cpu', context=None):
+        z, log_p = self.base_distribution.sample(batch_size, context=context, device=device)
+        x = self.f_inv(z, context=context).to(device)
+        return x, log_p
+
+    # FORWARD
+    def forward(self, x, transforms, context=None):
+        x = torch.stack([transforms(y) for y in x])
+        z = self.f(x, context)
+        return self.log_base(z, context)
+
+
+    # def forward(self, x, y=None, context=None, reduction='avg'):
+    #     #TODO - conditional version
+    #     z = self.f(x, context)
+    #     #TODO - check!!!
+    #     if reduction == 'sum':
+    #         return -self.base_distribution._log_base(z, context).sum()
+    #     else:
+    #         return -self.base_distribution._log_base(z, context).mean()
+
 
 
 class SimplexFlowDistribution(nn.Module):

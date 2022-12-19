@@ -37,19 +37,26 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 
+import torchvision
+import torchvision.transforms as tt
+
 from tqdm import tqdm
 
 from model_utils import ConditionalSimplexFlowDistribution, SimplexFlowDistribution
 from model_utils import ConditionalVoronoiFlowDistribution, VoronoiFlowDistribution
+from model_utils import BinaryFlowGroupARM, BinaryFlow
 from model_utils import (
     BaseGaussianDistribution,
     ConditionalGaussianDistribution,
     ResampledGaussianDistribution,
+    SemiAutoregressiveBernoulliDistribution
 )
 from model_utils import logsimplex_uniform_dequantize
 from model_utils import MLP
 import utils
 from voronoi import VoronoiTransform
+from bit_plane import Img2BP, bp2img, img2bp
+from linear_codes import HadamardCode
 
 log = logging.getLogger(__name__)
 
@@ -151,7 +158,7 @@ def samples_to_freq(samples, K):
 
 
 def compute_logpdf_simplex(
-    model, vardeq_model, discrete_samples, K, num_samples=1, device="cpu"
+        model, vardeq_model, discrete_samples, K, num_samples=1, device="cpu"
 ):
     n = discrete_samples.shape[0]
     discrete_samples = discrete_samples.repeat_interleave(num_samples, dim=0).to(device)
@@ -208,6 +215,46 @@ def compute_logpdf(model, vardeq_model, discrete_samples, num_samples=1, device=
     return logprob, avg_model_logprob, avg_dequant_logprob
 
 
+def compute_logpdf_binary_flows(model, discrete_samples, transforms, num_samples=1, device="cpu"):
+    n = discrete_samples.shape[0]
+    discrete_samples = discrete_samples.repeat_interleave(num_samples, dim=0).to(device)
+
+    # samples, dequantization_logpdf = vardeq_model.sample(
+    #     discrete_samples, return_logpdf=True
+    # )
+    #
+    # if torch.isnan(dequantization_logpdf).any():
+    #     log.info(f"Found NaN in dequantization probability.")
+
+    # logprob = model(samples)
+    logprob = model(discrete_samples, transforms)
+
+    if torch.isnan(logprob).any():
+        log.info(f"Found NaN in model probability.")
+
+    avg_model_logprob = logprob.nanmean()
+    # avg_dequant_logprob = dequantization_logpdf.nanmean()
+
+    # logprob = logprob - dequantization_logpdf
+    logprob = logprob # - 0
+
+    if torch.isnan(logprob).any():
+        raise RuntimeError(
+            "Found {} samples with NaN log probability.".format(
+                torch.isnan(logprob).sum().item()
+            )
+        )
+
+    # TODO - check if I have to do the logsumexp trick!!!
+    # I suppose that I have only one_sample
+    logprob = logprob.reshape(n, num_samples, 1)
+    logprob = torch.logsumexp(logprob, dim=1) - math.log(num_samples)
+    avg_dequant_logprob = torch.tensor(0.0)
+    # return logprob, avg_model_logprob, avg_dequant_logprob
+    # I assume that the avg_dequant_logprob is 0 cause I don't have any quantization/dequantization
+    return logprob, avg_model_logprob, avg_dequant_logprob
+
+
 def flatten(discrete_samples):
     K = discrete_samples.shape[-1]
     x, y = discrete_samples[:, 0], discrete_samples[:, 1]
@@ -221,6 +268,21 @@ def entropy(joint_pmf):
         if p > 0:
             entropy -= p * torch.log(p)
     return entropy
+
+
+def get_transforms(img_shape, bits=8, linear_codes=False):
+    if linear_codes:
+        transforms = torchvision.transforms.Compose([
+            tt.Lambda(lambda x: x.view(*img_shape)),
+            Img2BP(bits=bits), # calculate the bit plane
+            HadamardCode(bits=bits), # add linear code (Hadamard(8,3,4))
+        ])
+    else:
+        transforms = torchvision.transforms.Compose([
+            tt.Lambda(lambda x: x.view(*img_shape)),
+            Img2BP(bits=bits),# calculate the bit plane
+        ])
+    return transforms
 
 
 class Workspace:
@@ -282,7 +344,7 @@ class Workspace:
             os.path.join(self.work_dir, "imgs", "target_density.png"),
         )
 
-        def model_base_dist(d):
+        def model_base_dist(d=0):
             if self.cfg.base == "gaussian":
                 return BaseGaussianDistribution(d)
             elif self.cfg.base == "resampled":
@@ -290,94 +352,131 @@ class Workspace:
                     [d] + list(self.cfg.resampled.hdims) + [1], self.cfg.resampled.actfn
                 )
                 return ResampledGaussianDistribution(d, net_a, 100, 0.1)
+            elif self.cfg.base == "arbernoulli":
+                # TODO - add our distribution!!!
+                # M=32, ks=3, pad=1, conditional=False, conditional_classes=8
+                # TODO - check!!!
+                img_shape = (1, 1, self.num_discrete_variables)
+                return SemiAutoregressiveBernoulliDistribution(img_shape,
+                                                               self.cfg.arbernoulli.M,
+                                                               self.cfg.arbernoulli.ks,
+                                                               self.cfg.arbernoulli.pad,
+                                                               self.cfg.arbernoulli.conditional,
+                                                               self.cfg.arbernoulli.conditional_classes,
+                                                               self.cfg.linear_codes)
             else:
                 raise ValueError(f"Unknown base option {self.cfg.base}")
 
-        if self.cfg.dequantization == "simplex":
-            self.model = SimplexFlowDistribution(
-                num_discrete_variables=self.num_discrete_variables,
-                embedding_dim=self.num_classes - 1,
-                num_blocks=self.cfg.num_flows,
-                hdims=self.cfg.hdims,
-                base=model_base_dist(
-                    d=self.num_discrete_variables * (self.num_classes - 1)
-                ),
-                actfn=self.cfg.actfn,
-            ).to(self.device)
-
-            if self.cfg.vardeq:
-                self.vardeq_model = ConditionalSimplexFlowDistribution(
+        if self.cfg.binary_flows == True:
+            # create binary flows model, otherwise check dequantization
+            # TODO - add my model !!!
+            # img_shape = (1, 1, self.num_discrete_variables)
+            # transforms = get_transforms(img_shape=img_shape,
+            #                             bits=self.cfg.bits,
+            #                             linear_codes=self.cfg.linear_codes)
+            self.img_shape = (1, 1, self.num_discrete_variables)
+            self.transforms = get_transforms(img_shape=self.img_shape,
+                                             bits=self.cfg.bits,
+                                             linear_codes=self.cfg.linear_codes)
+            self.model = BinaryFlowGroupARM(base_distribution=model_base_dist(),
+                                            linear_codes=self.cfg.linear_codes,
+                                            bits=self.cfg.bits,
+                                            architecture=self.cfg.bf.architecture,
+                                            num_flows=self.cfg.bf.num_flows,
+                                            M=self.cfg.bf.M,
+                                            ks=self.cfg.bf.ks,
+                                            pad=self.cfg.bf.pad,
+                                            conditional=self.cfg.bf.conditional,
+                                            conditional_classes=self.cfg.bf.conditional_classes,
+                                            log=log)
+            self.all_parameters = set(list(self.model.parameters()))
+            # print(self.model)
+        else:
+            if self.cfg.dequantization == "simplex":
+                self.model = SimplexFlowDistribution(
                     num_discrete_variables=self.num_discrete_variables,
                     embedding_dim=self.num_classes - 1,
-                    use_dequant_flow=True,
-                    num_blocks=self.cfg.num_dequant_flows,
+                    num_blocks=self.cfg.num_flows,
                     hdims=self.cfg.hdims,
-                    base=BaseGaussianDistribution(
+                    base=model_base_dist(
                         d=self.num_discrete_variables * (self.num_classes - 1)
                     ),
                     actfn=self.cfg.actfn,
                 ).to(self.device)
-                self.all_parameters = set(
-                    list(self.model.parameters()) + list(self.vardeq_model.parameters())
+
+                if self.cfg.vardeq:
+                    self.vardeq_model = ConditionalSimplexFlowDistribution(
+                        num_discrete_variables=self.num_discrete_variables,
+                        embedding_dim=self.num_classes - 1,
+                        use_dequant_flow=True,
+                        num_blocks=self.cfg.num_dequant_flows,
+                        hdims=self.cfg.hdims,
+                        base=BaseGaussianDistribution(
+                            d=self.num_discrete_variables * (self.num_classes - 1)
+                        ),
+                        actfn=self.cfg.actfn,
+                    ).to(self.device)
+                    self.all_parameters = set(
+                        list(self.model.parameters()) + list(self.vardeq_model.parameters())
+                    )
+                else:
+                    self.vardeq_model = None
+                    self.all_parameters = set(list(self.model.parameters()))
+            elif self.cfg.dequantization == "voronoi":
+
+                voronoi_transform = VoronoiTransform(
+                    self.num_discrete_variables,
+                    self.num_classes,
+                    self.cfg.embedding_dim,
+                    learn_box_constraints=False,
                 )
-            else:
-                self.vardeq_model = None
-                self.all_parameters = set(list(self.model.parameters()))
-        elif self.cfg.dequantization == "voronoi":
 
-            voronoi_transform = VoronoiTransform(
-                self.num_discrete_variables,
-                self.num_classes,
-                self.cfg.embedding_dim,
-                learn_box_constraints=False,
-            )
-
-            self.model = VoronoiFlowDistribution(
-                voronoi_transform=voronoi_transform,
-                num_discrete_variables=self.num_discrete_variables,
-                embedding_dim=self.cfg.embedding_dim,
-                num_blocks=self.cfg.num_flows,
-                hdims=self.cfg.hdims,
-                base=model_base_dist(
-                    d=self.num_discrete_variables * self.cfg.embedding_dim
-                ),
-                actfn=self.cfg.actfn,
-                block_transform=self.cfg.block_transform,
-                num_mixtures=self.cfg.num_mixtures,
-            ).to(self.device)
-
-            if self.cfg.vardeq:
-                self.vardeq_model = ConditionalVoronoiFlowDistribution(
+                self.model = VoronoiFlowDistribution(
                     voronoi_transform=voronoi_transform,
                     num_discrete_variables=self.num_discrete_variables,
-                    num_classes=self.num_classes,
                     embedding_dim=self.cfg.embedding_dim,
-                    use_dequant_flow=False,
-                    num_blocks=self.cfg.num_dequant_flows,
+                    num_blocks=self.cfg.num_flows,
                     hdims=self.cfg.hdims,
-                    base=ConditionalGaussianDistribution(
-                        d=self.num_discrete_variables * self.cfg.embedding_dim,
-                        cond_embed_dim=self.num_discrete_variables
-                        * self.cfg.cond_embed_dim,
-                        actfn=self.cfg.actfn,
+                    base=model_base_dist(
+                        d=self.num_discrete_variables * self.cfg.embedding_dim
                     ),
                     actfn=self.cfg.actfn,
-                    cond_embed_dim=self.cfg.cond_embed_dim,
                     block_transform=self.cfg.block_transform,
                     num_mixtures=self.cfg.num_mixtures,
                 ).to(self.device)
-                self.all_parameters = set(
-                    list(self.model.parameters()) + list(self.vardeq_model.parameters())
-                )
-            else:
-                raise ValueError(
-                    "Option `vardeq` must be True for voronoi dequantization."
-                )
-        else:
-            raise ValueError(f"Unknown dequantization method {self.cfg.dequantization}")
 
-        print(self.model)
-        print(self.vardeq_model)
+                if self.cfg.vardeq:
+                    self.vardeq_model = ConditionalVoronoiFlowDistribution(
+                        voronoi_transform=voronoi_transform,
+                        num_discrete_variables=self.num_discrete_variables,
+                        num_classes=self.num_classes,
+                        embedding_dim=self.cfg.embedding_dim,
+                        use_dequant_flow=False,
+                        num_blocks=self.cfg.num_dequant_flows,
+                        hdims=self.cfg.hdims,
+                        base=ConditionalGaussianDistribution(
+                            d=self.num_discrete_variables * self.cfg.embedding_dim,
+                            cond_embed_dim=self.num_discrete_variables
+                                           * self.cfg.cond_embed_dim,
+                            actfn=self.cfg.actfn,
+                        ),
+                        actfn=self.cfg.actfn,
+                        cond_embed_dim=self.cfg.cond_embed_dim,
+                        block_transform=self.cfg.block_transform,
+                        num_mixtures=self.cfg.num_mixtures,
+                    ).to(self.device)
+                    self.all_parameters = set(
+                        list(self.model.parameters()) + list(self.vardeq_model.parameters())
+                    )
+                else:
+                    raise ValueError(
+                        "Option `vardeq` must be True for voronoi dequantization."
+                    )
+            else:
+                raise ValueError(f"Unknown dequantization method {self.cfg.dequantization}")
+
+        if self.cfg.binary_flows is not True:
+            print(self.vardeq_model)
 
         self.optimizer = optim.Adam(self.all_parameters, lr=self.cfg.lr)
 
@@ -386,11 +485,17 @@ class Workspace:
         self.dequant_logprob_meter = utils.RunningAverageMeter(0.9)
 
     def main(self):
-
         if self.iter == 0:
             self.initialize()
         else:
             log.info("Resuming with existing model.")
+        #
+        # if self.cfg.binary_flows:
+        #     # img_shape = (self.cfg.batch_size, 1, 1, self.num_discrete_variables)
+        #     img_shape = (1, 1, self.num_discrete_variables)
+        #     transforms = get_transforms(img_shape=img_shape,
+        #                                 bits=self.cfg.bits,
+        #                                 linear_codes=self.cfg.linear_codes)
 
         if self.joint_pmf.shape[0] < 10:
             probs = self.joint_pmf
@@ -417,27 +522,38 @@ class Workspace:
                 if self.cfg.flatten:
                     discrete_samples = flatten(discrete_samples)
 
-                if self.cfg.dequantization == "simplex":
-                    (
-                        logprob,
-                        avg_model_logprob,
-                        avg_dequant_logprob,
-                    ) = compute_logpdf_simplex(
+                if self.cfg.binary_flows == True:
+                    # TODO add binary flows
+                    # TODO add compute_logpdf_binary_flows method
+                    logprob, avg_model_logprob, avg_dequant_logprob = compute_logpdf_binary_flows(
                         self.model,
-                        self.vardeq_model,
                         discrete_samples,
-                        self.num_classes - 1,
+                        self.transforms,
                         num_samples=1,
-                        device=self.device,
-                    )
+                        device=self.device)
+                    # pass
                 else:
-                    logprob, avg_model_logprob, avg_dequant_logprob = compute_logpdf(
-                        self.model,
-                        self.vardeq_model,
-                        discrete_samples,
-                        num_samples=1,
-                        device=self.device,
-                    )
+                    if self.cfg.dequantization == "simplex":
+                        (
+                            logprob,
+                            avg_model_logprob,
+                            avg_dequant_logprob,
+                        ) = compute_logpdf_simplex(
+                            self.model,
+                            self.vardeq_model,
+                            discrete_samples,
+                            self.num_classes - 1,
+                            num_samples=1,
+                            device=self.device,
+                            )
+                    else:
+                        logprob, avg_model_logprob, avg_dequant_logprob = compute_logpdf(
+                            self.model,
+                            self.vardeq_model,
+                            discrete_samples,
+                            num_samples=1,
+                            device=self.device,
+                        )
 
                 loss = logprob.nanmean().mul_(-1)
 
@@ -450,7 +566,9 @@ class Workspace:
             self.model_logprob_meter.update(avg_model_logprob.item())
             self.dequant_logprob_meter.update(avg_dequant_logprob.item())
 
+            # if (self.iter + 1) % 1 == 0:
             if (self.iter + 1) % 200 == 0:
+            # if (self.iter + 1) % 100 == 0:
                 time_per_itr = (time.time() - start_time) / (self.iter - prev_itr)
                 prev_itr = self.iter
                 log.info(
@@ -466,6 +584,8 @@ class Workspace:
                 start_time = time.time()
 
             if (self.iter + 1) % 2500 == 0:
+            # if (self.iter + 1) % 100 == 0:
+            # if (self.iter + 1) % 1 == 0:
                 self.visualize()
 
             self.iter += 1
@@ -478,7 +598,14 @@ class Workspace:
     def evaluate(self):
 
         self.model.eval()
-        self.vardeq_model.eval()
+        # if self.cfg.binary_flows:
+        #     # img_shape = (self.cfg.batch_size, 1, 1, self.num_discrete_variables)
+        #     img_shape = (1, 1, self.num_discrete_variables)
+        #     transforms = get_transforms(img_shape=img_shape,
+        #                                 bits=self.cfg.bits,
+        #                                 linear_codes=self.cfg.linear_codes)
+        if self.cfg.binary_flows is not True:
+            self.vardeq_model.eval()
 
         test_nll_meter = utils.AverageMeter()
         test_model_logprob_meter = utils.AverageMeter()
@@ -489,27 +616,37 @@ class Workspace:
                 self.joint_pmf, self.cfg.test_batch_size, self.device
             )
 
-            if self.cfg.dequantization == "simplex":
-                (
-                    test_logprob,
-                    test_model_logprob,
-                    test_dequant_logprob,
-                ) = compute_logpdf_simplex(
+            if self.cfg.binary_flows == True:
+                # TODO add binary flows
+                # TODO add method compute_logpdf_binary_flows
+                test_logprob, test_model_logprob, test_dequant_logprob = compute_logpdf_binary_flows(
                     self.model,
-                    self.vardeq_model,
                     discrete_samples,
-                    self.num_classes - 1,
-                    num_samples=self.cfg.num_test_samples,
-                    device=self.device,
-                )
+                    self.transforms,
+                    num_samples=1,
+                    device=self.device)
             else:
-                test_logprob, test_model_logprob, test_dequant_logprob = compute_logpdf(
-                    self.model,
-                    self.vardeq_model,
-                    discrete_samples,
-                    num_samples=self.cfg.num_test_samples,
-                    device=self.device,
-                )
+                if self.cfg.dequantization == "simplex":
+                    (
+                        test_logprob,
+                        test_model_logprob,
+                        test_dequant_logprob,
+                    ) = compute_logpdf_simplex(
+                        self.model,
+                        self.vardeq_model,
+                        discrete_samples,
+                        self.num_classes - 1,
+                        num_samples=self.cfg.num_test_samples,
+                        device=self.device,
+                        )
+                else:
+                    test_logprob, test_model_logprob, test_dequant_logprob = compute_logpdf(
+                        self.model,
+                        self.vardeq_model,
+                        discrete_samples,
+                        num_samples=self.cfg.num_test_samples,
+                        device=self.device,
+                    )
             test_loss = test_logprob.mean().mul_(-1)
 
             test_nll_meter.update(test_loss.item(), discrete_samples.shape[0])
@@ -527,7 +664,8 @@ class Workspace:
             f" | Dequant Logprob {test_dequant_logprob_meter.avg:.4f})"
         )
         self.model.train()
-        self.vardeq_model.train()
+        if self.cfg.binary_flows is not True:
+            self.vardeq_model.train()
 
     def plot_embedding(self, z, label):
         if self.cfg.dequantization != "voronoi" or self.cfg.embedding_dim != 2:
@@ -541,9 +679,9 @@ class Workspace:
             self.model.voronoi_transform.anchor_pts.reshape(
                 self.num_discrete_variables, num_classes, -1
             )[:, :, :2]
-            .cpu()
-            .detach()
-            .numpy()
+                .cpu()
+                .detach()
+                .numpy()
         )
 
         for i in range(self.num_discrete_variables):
@@ -582,52 +720,82 @@ class Workspace:
                 "imgs",
                 f"{label}_discrete_samples_iter{self.iter:06d}.png",
             ),
-        )
+            )
 
     def visualize_samples_hq(self):
         self.model.eval()
-        self.vardeq_model.eval()
-        if self.cfg.dequantization == "voronoi":
+        if self.cfg.binary_flows == True:
             with torch.no_grad():
-
                 all_model_discrete_samples = []
 
                 for _ in tqdm(range(10)):
-                    z = self.model.sample(1000000)
+                    z, log_p = self.model.sample(1000000)
+                    if self.cfg.linear_codes:
+                        z = bp2img(z[:, 8:], bits=self.cfg.bits)
+                    else:
+                        z = bp2img(z, bits=self.cfg.bits)
+                    z = torch.squeeze(z)
+                    all_model_discrete_samples.append(z.cpu())
+                model_discrete_samples = torch.cat(all_model_discrete_samples, dim=0)
+                self.plot_discrete_samples_hist(model_discrete_samples, "binary_flows_model_final")
+        else:
+            self.vardeq_model.eval()
+            if self.cfg.dequantization == "voronoi":
+                with torch.no_grad():
+
+                    all_model_discrete_samples = []
+
+                    for _ in tqdm(range(10)):
+                        z = self.model.sample(1000000)
+                        model_discrete_samples_one_hot = self.model.voronoi_transform.find_nearest(
+                            z
+                        )
+                        model_discrete_samples = torch.argmax(
+                            model_discrete_samples_one_hot.float(), dim=-1
+                        )
+                        all_model_discrete_samples.append(model_discrete_samples.cpu())
+                    model_discrete_samples = torch.cat(all_model_discrete_samples, dim=0)
+                    self.plot_discrete_samples_hist(model_discrete_samples, "model_final")
+                    # self.plot_embedding(z, "model_final")
+
+    def visualize(self):
+        self.model.eval()
+        if self.cfg.binary_flows:
+            with torch.no_grad():
+                # discrete_samples = sample_from_joint_pmf(
+                #     self.joint_pmf, 10000, self.device
+                # )
+                # z = self.model.sample(discrete_samples)
+                # self.plot_discrete_samples_hist(discrete_samples, "binary_flows_dequant")
+
+                z, log_p = self.model.sample(10000)
+                if self.cfg.linear_codes:
+                    z = bp2img(z[:, 8:], bits=self.cfg.bits)
+                else:
+                    z = bp2img(z, bits=self.cfg.bits)
+                z = torch.squeeze(z)
+                self.plot_discrete_samples_hist(z, "binary_flows_model")
+        else:
+            self.vardeq_model.eval()
+            # Plot samples from the dequantization model and the density model.
+            if self.cfg.dequantization == "voronoi":
+                with torch.no_grad():
+                    discrete_samples = sample_from_joint_pmf(
+                        self.joint_pmf, 10000, self.device
+                    )
+                    z = self.vardeq_model.sample(discrete_samples)
+                    self.plot_discrete_samples_hist(discrete_samples, "dequant")
+                    self.plot_embedding(z, "dequant")
+
+                    z = self.model.sample(10000)
                     model_discrete_samples_one_hot = self.model.voronoi_transform.find_nearest(
                         z
                     )
                     model_discrete_samples = torch.argmax(
                         model_discrete_samples_one_hot.float(), dim=-1
                     )
-                    all_model_discrete_samples.append(model_discrete_samples.cpu())
-                model_discrete_samples = torch.cat(all_model_discrete_samples, dim=0)
-                self.plot_discrete_samples_hist(model_discrete_samples, "model_final")
-                # self.plot_embedding(z, "model_final")
-
-    def visualize(self):
-        self.model.eval()
-        self.vardeq_model.eval()
-
-        # Plot samples from the dequantization model and the density model.
-        if self.cfg.dequantization == "voronoi":
-            with torch.no_grad():
-                discrete_samples = sample_from_joint_pmf(
-                    self.joint_pmf, 10000, self.device
-                )
-                z = self.vardeq_model.sample(discrete_samples)
-                self.plot_discrete_samples_hist(discrete_samples, "dequant")
-                self.plot_embedding(z, "dequant")
-
-                z = self.model.sample(10000)
-                model_discrete_samples_one_hot = self.model.voronoi_transform.find_nearest(
-                    z
-                )
-                model_discrete_samples = torch.argmax(
-                    model_discrete_samples_one_hot.float(), dim=-1
-                )
-                self.plot_discrete_samples_hist(model_discrete_samples, "model")
-                self.plot_embedding(z, "model")
+                    self.plot_discrete_samples_hist(model_discrete_samples, "model")
+                    self.plot_embedding(z, "model")
 
         if self.num_discrete_variables == 1:
             K = int(math.sqrt(self.num_classes))
@@ -644,23 +812,35 @@ class Workspace:
                 joint_idx = torch.stack([x, y], axis=-1).reshape(-1, 2)
 
             with torch.no_grad():
-                if self.cfg.dequantization == "simplex":
-                    logprob, _, _ = compute_logpdf_simplex(
+                if self.cfg.binary_flows == True:
+                    # img_shape = (1, 1, self.num_discrete_variables)
+                    # transforms = get_transforms(img_shape=img_shape,
+                    #                             bits=self.cfg.bits,
+                    #                             linear_codes=self.cfg.linear_codes)
+                    logprob, _, _ = compute_logpdf_binary_flows(
                         self.model,
-                        self.vardeq_model,
                         joint_idx,
-                        K - 1,
+                        self.transforms,
                         num_samples=10,
-                        device=self.device,
-                    )
+                        device=self.device)
                 else:
-                    logprob, _, _ = compute_logpdf(
-                        self.model,
-                        self.vardeq_model,
-                        joint_idx,
-                        num_samples=10,
-                        device=self.device,
-                    )
+                    if self.cfg.dequantization == "simplex":
+                        logprob, _, _ = compute_logpdf_simplex(
+                            self.model,
+                            self.vardeq_model,
+                            joint_idx,
+                            K - 1,
+                            num_samples=10,
+                            device=self.device,
+                            )
+                    else:
+                        logprob, _, _ = compute_logpdf(
+                            self.model,
+                            self.vardeq_model,
+                            joint_idx,
+                            num_samples=10,
+                            device=self.device,
+                        )
 
             logprob = logprob.reshape(K, K)
 
@@ -685,7 +865,9 @@ class Workspace:
             )
 
         self.model.train()
-        self.vardeq_model.train()
+
+        if self.cfg.binary_flows is not True:
+            self.vardeq_model.train()
 
     def save_pmf(self, data, filename):
         fig = plt.figure(figsize=(1, 1))
@@ -711,7 +893,7 @@ class Workspace:
 from train_discrete2d import Workspace as W
 
 
-@hydra.main(config_path="configs", config_name="discrete2d")
+@hydra.main(config_path="configs", config_name="discrete2d_binary_flows")
 def main(cfg):
     fname = os.getcwd() + "/latest.pkl"
     if os.path.exists(fname):
