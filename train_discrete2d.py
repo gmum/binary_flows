@@ -354,13 +354,13 @@ class Workspace:
                 return ResampledGaussianDistribution(d, net_a, 100, 0.1)
             elif self.cfg.base == "arbernoulli":
                 # TODO - add our distribution!!!
-                # M=32, ks=3, pad=1, conditional=False, conditional_classes=8
                 # TODO - check!!!
                 img_shape = (1, 1, self.num_discrete_variables)
                 return SemiAutoregressiveBernoulliDistribution(img_shape,
                                                                self.cfg.arbernoulli.M,
                                                                self.cfg.arbernoulli.ks,
                                                                self.cfg.arbernoulli.pad,
+                                                               self.cfg.bits,
                                                                self.cfg.arbernoulli.conditional,
                                                                self.cfg.arbernoulli.conditional_classes,
                                                                self.cfg.linear_codes)

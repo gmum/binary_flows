@@ -32,20 +32,26 @@ import wandb
 
 import torch
 import torch.optim as optim
+import torchvision
+import torchvision.transforms as tt
 
 import discrete_datasets
 from model_utils import ConditionalSimplexFlowDistribution, SimplexFlowDistribution
 from model_utils import ConditionalVoronoiFlowDistribution, VoronoiFlowDistribution
 from model_utils import ConditionalArgmaxFlowDistribution
+from model_utils import BinaryFlowGroupARM, BinaryFlow
 from model_utils import (
     BaseGaussianDistribution,
     ConditionalGaussianDistribution,
     ResampledGaussianDistribution,
+    SemiAutoregressiveBernoulliDistribution,
 )
 from model_utils import MLP
 import utils
 from utils import StupidNaNsException
 from voronoi import VoronoiTransform
+from bit_plane import Img2BP, bp2img, img2bp
+from linear_codes import HadamardCode
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +101,57 @@ def compute_logpdf(
 
     return logprob, avg_model_logprob, avg_dequant_logprob
 
+
+# TODO - add compute_logpdf method for binary flows
+def compute_logpdf_binary_flows(
+        model, discrete_samples, transforms, num_samples=1, device="cpu", bpd=False
+):
+    n = discrete_samples.shape[0]
+    discrete_samples = discrete_samples.repeat_interleave(num_samples, dim=0).to(device)
+    # samples, dequantization_logpdf = vardeq_model.sample(
+    #     discrete_samples, return_logpdf=True
+    # )
+
+    logprob = model(discrete_samples, transforms)
+
+    if ~torch.isfinite(logprob).all():
+        log.warn(
+            "Found {} samples with NaN or Inf log probability from model.".format(
+                (~torch.isfinite(logprob)).sum().item()
+            )
+        )
+
+    avg_model_logprob = logprob.mean()
+    # avg_dequant_logprob = dequantization_logpdf.mean()
+
+    # logprob = logprob - dequantization_logpdf
+    logprob = logprob # - 0
+
+    # if ~torch.isfinite(dequantization_logpdf).all():
+    #     log.warn(
+    #         "Found {} samples with NaN or Inf log probability from dequant model.".format(
+    #             (~torch.isfinite(dequantization_logpdf)).sum().item()
+    #         )
+    #     )
+
+    avg_dequant_logprob = torch.tensor(0.0)
+
+    logprob = logprob.reshape(n, num_samples, 1)
+    logprob = torch.logsumexp(logprob, dim=1) - math.log(num_samples)
+
+    if bpd:
+        # Convert to bits per dimension.
+        logprob = logprob / (math.log(2) * discrete_samples.shape[1])
+        avg_model_logprob = avg_model_logprob / (
+                math.log(2) * discrete_samples.shape[1]
+        )
+        avg_dequant_logprob = avg_dequant_logprob / (
+                math.log(2) * discrete_samples.shape[1]
+        )
+
+    return logprob, avg_model_logprob, avg_dequant_logprob
+
+
 def learning_rate_schedule(global_step, warmup_steps, base_learning_rate, train_steps):
     warmup_steps = int(round(warmup_steps))
     scaled_lr = base_learning_rate
@@ -113,6 +170,21 @@ def learning_rate_schedule(global_step, warmup_steps, base_learning_rate, train_
 def set_learning_rate(optimizer, lr):
     for i, group in enumerate(optimizer.param_groups):
         group['lr'] = lr
+
+
+def get_transforms(img_shape, bits=8, linear_codes=False):
+    if linear_codes:
+        transforms = torchvision.transforms.Compose([
+            tt.Lambda(lambda x: x.view(*img_shape)),
+            Img2BP(bits=bits), # calculate the bit plane
+            HadamardCode(bits=bits), # add linear code (Hadamard(8,3,4))
+        ])
+    else:
+        transforms = torchvision.transforms.Compose([
+            tt.Lambda(lambda x: x.view(*img_shape)),
+            Img2BP(bits=bits),# calculate the bit plane
+        ])
+    return transforms
 
 
 class Workspace:
@@ -248,7 +320,7 @@ class Workspace:
             log.info("Resuming from existing model.")
             return data_loaders
 
-        def model_base_dist(d):
+        def model_base_dist(d=0):
             if self.cfg.base == "gaussian":
                 return BaseGaussianDistribution(d)
             elif self.cfg.base == "resampled":
@@ -256,166 +328,200 @@ class Workspace:
                     [d] + list(self.cfg.resampled.hdims) + [1], self.cfg.resampled.actfn
                 )
                 return ResampledGaussianDistribution(d, net_a, 100, 0.1)
+            elif self.cfg.base == "arbernoulli":
+                # TODO - add our distribution!!!
+                # TODO - check!!!
+                img_shape = (1, 1, self.num_discrete_variables)
+                return SemiAutoregressiveBernoulliDistribution(img_shape,
+                                                               self.cfg.arbernoulli.M,
+                                                               self.cfg.arbernoulli.ks,
+                                                               self.cfg.arbernoulli.pad,
+                                                               self.cfg.bits,
+                                                               self.cfg.arbernoulli.conditional,
+                                                               self.cfg.arbernoulli.conditional_classes,
+                                                               self.cfg.linear_codes)
             else:
                 raise ValueError(f"Unknown base option {self.cfg.base}")
 
-        if self.cfg.dequantization == "simplex":
-            self.model = SimplexFlowDistribution(
-                self.num_discrete_variables,
-                self.num_classes - 1,
-                self.cfg.num_flows,
-                self.cfg.hdims,
-                base=model_base_dist(
-                    d=self.num_discrete_variables * (self.num_classes - 1)
-                ),
-                actfn=self.cfg.actfn,
-                arch=self.cfg.arch,
-                num_transformer_layers=self.cfg.num_transformer_layers,
-                transformer_d_model=self.cfg.transformer_d_model,
-                transformer_dropout=self.cfg.transformer_dropout,
-                block_transform=self.cfg.block_transform,
-                num_mixtures=self.cfg.num_mixtures,
-                flow_type=self.cfg.flow_type,
-            ).to(self.device)
-
-            self.vardeq_model = ConditionalSimplexFlowDistribution(
-                self.num_discrete_variables,
-                self.num_classes - 1,
-                self.cfg.use_dequant_flow,
-                self.cfg.num_dequant_flows,
-                self.cfg.hdims,
-                base=BaseGaussianDistribution(
-                    d=self.num_discrete_variables * (self.num_classes - 1)
-                ),
-                actfn=self.cfg.actfn,
-                cond_embed_dim=self.cfg.cond_embed_dim,
-                arch=self.cfg.arch,
-                num_transformer_layers=self.cfg.num_transformer_layers,
-                transformer_d_model=self.cfg.transformer_d_model,
-                transformer_dropout=self.cfg.transformer_dropout,
-                block_transform=self.cfg.block_transform,
-                num_mixtures=self.cfg.num_mixtures,
-                use_contextnet=self.cfg.use_contextnet,
-                flow_type=self.cfg.flow_type,
-            ).to(self.device)
-            self.all_parameters = set(
-                list(self.model.parameters()) + list(self.vardeq_model.parameters())
-            )
-
-        elif self.cfg.dequantization == "voronoi":
-
-            voronoi_transform = VoronoiTransform(
-                self.num_discrete_variables,
-                self.num_classes,
-                self.cfg.embedding_dim,
-                share_embeddings=self.cfg.share_embeddings,
-                learn_box_constraints=self.cfg.learn_box_constraints,
-            )
-
-            self.model = VoronoiFlowDistribution(
-                voronoi_transform,
-                self.num_discrete_variables,
-                self.cfg.embedding_dim,
-                self.cfg.num_flows,
-                self.cfg.hdims,
-                base=model_base_dist(
-                    d=self.num_discrete_variables * self.cfg.embedding_dim
-                ),
-                actfn=self.cfg.actfn,
-                use_logit_transform=self.cfg.use_logit_transform,
-                arch=self.cfg.arch,
-                num_transformer_layers=self.cfg.num_transformer_layers,
-                transformer_d_model=self.cfg.transformer_d_model,
-                transformer_dropout=self.cfg.transformer_dropout,
-                block_transform=self.cfg.block_transform,
-                num_mixtures=self.cfg.num_mixtures,
-                flow_type=self.cfg.flow_type,
-            ).to(self.device)
-
-            self.vardeq_model = ConditionalVoronoiFlowDistribution(
-                voronoi_transform,
-                self.num_discrete_variables,
-                self.num_classes,
-                self.cfg.embedding_dim,
-                self.cfg.use_dequant_flow,
-                self.cfg.num_dequant_flows,
-                self.cfg.hdims,
-                base=ConditionalGaussianDistribution(
-                    d=self.num_discrete_variables * self.cfg.embedding_dim,
-                    cond_embed_dim=self.num_discrete_variables
-                    * self.cfg.cond_embed_dim,
-                    actfn=self.cfg.actfn,
-                ),
-                actfn=self.cfg.actfn,
-                cond_embed_dim=self.cfg.cond_embed_dim,
-                share_embeddings=self.cfg.share_embeddings,
-                arch=self.cfg.arch,
-                num_transformer_layers=self.cfg.num_transformer_layers,
-                transformer_d_model=self.cfg.transformer_d_model,
-                transformer_dropout=self.cfg.transformer_dropout,
-                block_transform=self.cfg.block_transform,
-                num_mixtures=self.cfg.num_mixtures,
-                use_contextnet=self.cfg.use_contextnet,
-                flow_type=self.cfg.flow_type,
-            ).to(self.device)
-            self.all_parameters = set(
-                list(self.model.parameters()) + list(self.vardeq_model.parameters())
-            )
-
-        elif self.cfg.dequantization == "argmax":
-            embedding_dim = int(np.ceil(np.log2(self.num_classes)))
-
-            self.model = VoronoiFlowDistribution(
-                None,
-                self.num_discrete_variables,
-                embedding_dim,
-                self.cfg.num_flows,
-                self.cfg.hdims,
-                base=model_base_dist(d=self.num_discrete_variables * embedding_dim),
-                actfn=self.cfg.actfn,
-                use_logit_transform=False,
-                arch=self.cfg.arch,
-                num_transformer_layers=self.cfg.num_transformer_layers,
-                transformer_d_model=self.cfg.transformer_d_model,
-                transformer_dropout=self.cfg.transformer_dropout,
-                block_transform=self.cfg.block_transform,
-                num_mixtures=self.cfg.num_mixtures,
-                flow_type=self.cfg.flow_type,
-            ).to(self.device)
-
-            self.vardeq_model = ConditionalArgmaxFlowDistribution(
-                self.num_discrete_variables,
-                self.num_classes,
-                self.cfg.use_dequant_flow,
-                self.cfg.num_dequant_flows,
-                self.cfg.hdims,
-                base=ConditionalGaussianDistribution(
-                    d=self.num_discrete_variables * embedding_dim,
-                    cond_embed_dim=self.num_discrete_variables
-                    * self.cfg.cond_embed_dim,
-                    actfn=self.cfg.actfn,
-                ),
-                actfn=self.cfg.actfn,
-                cond_embed_dim=self.cfg.cond_embed_dim,
-                share_embeddings=self.cfg.share_embeddings,
-                arch=self.cfg.arch,
-                num_transformer_layers=self.cfg.num_transformer_layers,
-                transformer_d_model=self.cfg.transformer_d_model,
-                transformer_dropout=self.cfg.transformer_dropout,
-                block_transform=self.cfg.block_transform,
-                num_mixtures=self.cfg.num_mixtures,
-                use_contextnet=self.cfg.use_contextnet,
-                flow_type=self.cfg.flow_type,
-            ).to(self.device)
-
-            self.all_parameters = set(
-                list(self.model.parameters()) + list(self.vardeq_model.parameters())
-            )
+        if self.cfg.binary_flows == True:
+            # create binary flows model, otherwise check dequantization
+            # TODO - add my model !!!
+            self.img_shape = (1, 1, self.num_discrete_variables)
+            transforms = get_transforms(img_shape=self.img_shape,
+                                        bits=self.cfg.bits,
+                                        linear_codes=self.cfg.linear_codes)
+            self.model = BinaryFlowGroupARM(base_distribution=model_base_dist(),
+                                            linear_codes=self.cfg.linear_codes,
+                                            bits=self.cfg.bits,
+                                            architecture=self.cfg.bf.architecture,
+                                            num_flows=self.cfg.bf.num_flows,
+                                            M=self.cfg.bf.M,
+                                            ks=self.cfg.bf.ks,
+                                            pad=self.cfg.bf.pad,
+                                            conditional=self.cfg.bf.conditional,
+                                            conditional_classes=self.cfg.bf.conditional_classes,
+                                            log=log)
+            self.all_parameters = set(list(self.model.parameters()))
         else:
-            raise ValueError(f"Unknown dequantization method {self.cfg.dequantization}")
+            if self.cfg.dequantization == "simplex":
+                self.model = SimplexFlowDistribution(
+                    self.num_discrete_variables,
+                    self.num_classes - 1,
+                    self.cfg.num_flows,
+                    self.cfg.hdims,
+                    base=model_base_dist(
+                        d=self.num_discrete_variables * (self.num_classes - 1)
+                    ),
+                    actfn=self.cfg.actfn,
+                    arch=self.cfg.arch,
+                    num_transformer_layers=self.cfg.num_transformer_layers,
+                    transformer_d_model=self.cfg.transformer_d_model,
+                    transformer_dropout=self.cfg.transformer_dropout,
+                    block_transform=self.cfg.block_transform,
+                    num_mixtures=self.cfg.num_mixtures,
+                    flow_type=self.cfg.flow_type,
+                ).to(self.device)
+
+                self.vardeq_model = ConditionalSimplexFlowDistribution(
+                    self.num_discrete_variables,
+                    self.num_classes - 1,
+                    self.cfg.use_dequant_flow,
+                    self.cfg.num_dequant_flows,
+                    self.cfg.hdims,
+                    base=BaseGaussianDistribution(
+                        d=self.num_discrete_variables * (self.num_classes - 1)
+                    ),
+                    actfn=self.cfg.actfn,
+                    cond_embed_dim=self.cfg.cond_embed_dim,
+                    arch=self.cfg.arch,
+                    num_transformer_layers=self.cfg.num_transformer_layers,
+                    transformer_d_model=self.cfg.transformer_d_model,
+                    transformer_dropout=self.cfg.transformer_dropout,
+                    block_transform=self.cfg.block_transform,
+                    num_mixtures=self.cfg.num_mixtures,
+                    use_contextnet=self.cfg.use_contextnet,
+                    flow_type=self.cfg.flow_type,
+                ).to(self.device)
+                self.all_parameters = set(
+                    list(self.model.parameters()) + list(self.vardeq_model.parameters())
+                )
+
+            elif self.cfg.dequantization == "voronoi":
+
+                voronoi_transform = VoronoiTransform(
+                    self.num_discrete_variables,
+                    self.num_classes,
+                    self.cfg.embedding_dim,
+                    share_embeddings=self.cfg.share_embeddings,
+                    learn_box_constraints=self.cfg.learn_box_constraints,
+                )
+
+                self.model = VoronoiFlowDistribution(
+                    voronoi_transform,
+                    self.num_discrete_variables,
+                    self.cfg.embedding_dim,
+                    self.cfg.num_flows,
+                    self.cfg.hdims,
+                    base=model_base_dist(
+                        d=self.num_discrete_variables * self.cfg.embedding_dim
+                    ),
+                    actfn=self.cfg.actfn,
+                    use_logit_transform=self.cfg.use_logit_transform,
+                    arch=self.cfg.arch,
+                    num_transformer_layers=self.cfg.num_transformer_layers,
+                    transformer_d_model=self.cfg.transformer_d_model,
+                    transformer_dropout=self.cfg.transformer_dropout,
+                    block_transform=self.cfg.block_transform,
+                    num_mixtures=self.cfg.num_mixtures,
+                    flow_type=self.cfg.flow_type,
+                ).to(self.device)
+
+                self.vardeq_model = ConditionalVoronoiFlowDistribution(
+                    voronoi_transform,
+                    self.num_discrete_variables,
+                    self.num_classes,
+                    self.cfg.embedding_dim,
+                    self.cfg.use_dequant_flow,
+                    self.cfg.num_dequant_flows,
+                    self.cfg.hdims,
+                    base=ConditionalGaussianDistribution(
+                        d=self.num_discrete_variables * self.cfg.embedding_dim,
+                        cond_embed_dim=self.num_discrete_variables
+                        * self.cfg.cond_embed_dim,
+                        actfn=self.cfg.actfn,
+                    ),
+                    actfn=self.cfg.actfn,
+                    cond_embed_dim=self.cfg.cond_embed_dim,
+                    share_embeddings=self.cfg.share_embeddings,
+                    arch=self.cfg.arch,
+                    num_transformer_layers=self.cfg.num_transformer_layers,
+                    transformer_d_model=self.cfg.transformer_d_model,
+                    transformer_dropout=self.cfg.transformer_dropout,
+                    block_transform=self.cfg.block_transform,
+                    num_mixtures=self.cfg.num_mixtures,
+                    use_contextnet=self.cfg.use_contextnet,
+                    flow_type=self.cfg.flow_type,
+                ).to(self.device)
+                self.all_parameters = set(
+                    list(self.model.parameters()) + list(self.vardeq_model.parameters())
+                )
+
+            elif self.cfg.dequantization == "argmax":
+                embedding_dim = int(np.ceil(np.log2(self.num_classes)))
+
+                self.model = VoronoiFlowDistribution(
+                    None,
+                    self.num_discrete_variables,
+                    embedding_dim,
+                    self.cfg.num_flows,
+                    self.cfg.hdims,
+                    base=model_base_dist(d=self.num_discrete_variables * embedding_dim),
+                    actfn=self.cfg.actfn,
+                    use_logit_transform=False,
+                    arch=self.cfg.arch,
+                    num_transformer_layers=self.cfg.num_transformer_layers,
+                    transformer_d_model=self.cfg.transformer_d_model,
+                    transformer_dropout=self.cfg.transformer_dropout,
+                    block_transform=self.cfg.block_transform,
+                    num_mixtures=self.cfg.num_mixtures,
+                    flow_type=self.cfg.flow_type,
+                ).to(self.device)
+
+                self.vardeq_model = ConditionalArgmaxFlowDistribution(
+                    self.num_discrete_variables,
+                    self.num_classes,
+                    self.cfg.use_dequant_flow,
+                    self.cfg.num_dequant_flows,
+                    self.cfg.hdims,
+                    base=ConditionalGaussianDistribution(
+                        d=self.num_discrete_variables * embedding_dim,
+                        cond_embed_dim=self.num_discrete_variables
+                        * self.cfg.cond_embed_dim,
+                        actfn=self.cfg.actfn,
+                    ),
+                    actfn=self.cfg.actfn,
+                    cond_embed_dim=self.cfg.cond_embed_dim,
+                    share_embeddings=self.cfg.share_embeddings,
+                    arch=self.cfg.arch,
+                    num_transformer_layers=self.cfg.num_transformer_layers,
+                    transformer_d_model=self.cfg.transformer_d_model,
+                    transformer_dropout=self.cfg.transformer_dropout,
+                    block_transform=self.cfg.block_transform,
+                    num_mixtures=self.cfg.num_mixtures,
+                    use_contextnet=self.cfg.use_contextnet,
+                    flow_type=self.cfg.flow_type,
+                ).to(self.device)
+
+                self.all_parameters = set(
+                    list(self.model.parameters()) + list(self.vardeq_model.parameters())
+                )
+            else:
+                raise ValueError(f"Unknown dequantization method {self.cfg.dequantization}")
 
         self.ema_model = utils.ExponentialMovingAverage(self.model)
-        self.ema_vardeq_model = utils.ExponentialMovingAverage(self.vardeq_model)
+
+        if self.cfg.binary_flows is not True:
+            self.ema_vardeq_model = utils.ExponentialMovingAverage(self.vardeq_model)
 
         self.optimizer = optim.AdamW(
             self.all_parameters, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay
@@ -424,9 +530,10 @@ class Workspace:
         log.info("--- Model ---")
         log.info(self.model)
         log.info(self.ema_model)
-        log.info("--- Dequant Model ---")
-        log.info(self.vardeq_model)
-        log.info(self.ema_vardeq_model)
+        if self.cfg.binary_flows is not True:
+            log.info("--- Dequant Model ---")
+            log.info(self.vardeq_model)
+            log.info(self.ema_vardeq_model)
 
         self.loss_meter = utils.RunningAverageMeter(0.99)
         self.model_logprob_meter = utils.RunningAverageMeter(0.99)
@@ -449,14 +556,35 @@ class Workspace:
             set_learning_rate(self.optimizer, lr)
 
             batch = next(train_data_generator)[0]
-            logprob, avg_model_logprob, avg_dequant_logprob = compute_logpdf(
-                self.model,
-                self.vardeq_model,
-                batch,
-                device=self.device,
-                # bpd=self.cfg.dataset in ["text8", "enwik8"],
-                bpd=False,
-            )
+            # log.info(
+            #     f"Iter {self.iter} \n"
+            #     f" | Batch \n"
+            #     f" | {batch} \n"
+            #     f" | {batch.shape} \n"
+            #     f" | batch[0]: {batch[0]} \n"
+            #     f" | batch[1]: {batch[1]} \n"
+            # )
+
+            if self.cfg.binary_flows == True:
+                transforms = get_transforms(img_shape=self.img_shape,
+                                            bits=self.cfg.bits,
+                                            linear_codes=self.cfg.linear_codes)
+                logprob, avg_model_logprob, avg_dequant_logprob = compute_logpdf_binary_flows(
+                    self.model,
+                    batch,
+                    transforms,
+                    device=self.device,
+                    bpd=False
+                )
+            else:
+                logprob, avg_model_logprob, avg_dequant_logprob = compute_logpdf(
+                    self.model,
+                    self.vardeq_model,
+                    batch,
+                    device=self.device,
+                    # bpd=self.cfg.dataset in ["text8", "enwik8"],
+                    bpd=False,
+                )
 
             loss = logprob[torch.isfinite(logprob)].mean().mul_(-1)
 
@@ -472,7 +600,8 @@ class Workspace:
 
             if self.iter >= self.cfg.iterations // 2:
                 self.ema_model.apply()
-                self.ema_vardeq_model.apply()
+                if self.cfg.binary_flows is not True:
+                    self.ema_vardeq_model.apply()
 
             self.loss_meter.update(loss.item())
             self.model_logprob_meter.update(avg_model_logprob.item())
@@ -522,9 +651,11 @@ class Workspace:
 
         if self.cfg.ema_eval and self.iter >= self.cfg.iterations // 2:
             self.ema_model.swap()
-            self.ema_vardeq_model.swap()
+            if self.cfg.binary_flows is not True:
+                self.ema_vardeq_model.swap()
         self.model.eval()
-        self.vardeq_model.eval()
+        if self.cfg.binary_flows is not True:
+            self.vardeq_model.eval()
 
         eval_nll_meter = utils.AverageMeter()
         eval_model_logprob_meter = utils.AverageMeter()
@@ -533,15 +664,29 @@ class Workspace:
         for batch in dataloader:
             batch = batch[0]
 
-            eval_logprob, eval_model_logprob, eval_dequant_logprob = compute_logpdf(
-                self.model,
-                self.vardeq_model,
-                batch,
-                num_samples=self.cfg.num_eval_samples,
-                device=self.device,
-                # bpd=self.cfg.dataset in ["text8", "enwik8"],
-                bpd=False,
-            )
+            if self.cfg.binary_flows is True:
+                transforms = get_transforms(img_shape=self.img_shape,
+                                            bits=self.cfg.bits,
+                                            linear_codes=self.cfg.linear_codes)
+                eval_logprob, eval_model_logprob, eval_dequant_logprob = compute_logpdf_binary_flows(
+                    self.model,
+                    batch,
+                    transforms,
+                    num_samples=self.cfg.num_eval_samples,
+                    device=self.device,
+                    bpd=False
+                )
+            else:
+                eval_logprob, eval_model_logprob, eval_dequant_logprob = compute_logpdf(
+                    self.model,
+                    self.vardeq_model,
+                    batch,
+                    num_samples=self.cfg.num_eval_samples,
+                    device=self.device,
+                    # bpd=self.cfg.dataset in ["text8", "enwik8"],
+                    bpd=False,
+                )
+
             eval_loss = eval_logprob.mean().mul_(-1)
 
             eval_nll_meter.update(eval_loss.item(), batch.shape[0])
@@ -568,9 +713,11 @@ class Workspace:
 
         if self.cfg.ema_eval and self.iter >= self.cfg.iterations // 2:
             self.ema_model.swap()
-            self.ema_vardeq_model.swap()
+            if self.cfg.binary_flows is not True:
+                self.ema_vardeq_model.swap()
         self.model.train()
-        self.vardeq_model.train()
+        if self.cfg.binary_flows is not True:
+            self.vardeq_model.train()
         return eval_nll_meter.avg
 
     def save(self, tag="latest"):
@@ -599,7 +746,7 @@ def run_with_automatic_resume(workspace, fname, n_resumes):
         run_with_automatic_resume(workspace, fname, n_resumes - 1)
 
 
-@hydra.main(config_path="configs", config_name="uci_categorical")
+@hydra.main(config_path="configs", config_name="uci_categorical_binary_flows")
 def main(cfg):
     fname = os.getcwd() + "/latest.pkl"
     if os.path.exists(fname):

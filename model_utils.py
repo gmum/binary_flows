@@ -280,7 +280,7 @@ class ConditionalGaussianDistribution(nn.Module):
 
 
 class SemiAutoregressiveBernoulliDistribution(nn.Module):
-    def __init__(self, img_shape, M=32, ks=3, pad=1, conditional=False, conditional_classes=8, linear_codes=False):
+    def __init__(self, img_shape, M=32, ks=3, pad=1, bits=8, conditional=False, conditional_classes=8, linear_codes=False):
         super().__init__()
         self.img_shape = img_shape
         self.M = M
@@ -289,14 +289,13 @@ class SemiAutoregressiveBernoulliDistribution(nn.Module):
         self.conditional = conditional
         self.conditional_classes = conditional_classes
         self.linear_codes = linear_codes
+        self.bits = bits
         linear_codes_size = 8 if self.linear_codes else 0
         if self.conditional:
-            self.net_base = torch.nn.ModuleList([single_net_conditional(self.M, self.ks, self.pad, i+1) for i in range(self.conditional_classes - 1 + linear_codes_size)])
+            self.net_base = torch.nn.ModuleList([single_net_conditional(self.M, self.ks, self.pad, i+1) for i in range(self.bits - 1 + linear_codes_size + self.conditional_classes)])
         else:
-            self.net_base = torch.nn.ModuleList([single_net(self.M, self.ks, self.pad, i+1) for i in range(self.conditional_classes - 1 + linear_codes_size)])
-        # self.net = nn.Sequential(
-        #     nn.Linear(cond_embed_dim, 1024), actfns[actfn](), nn.Linear(1024, d * 2)
-        # )
+            self.net_base = torch.nn.ModuleList([single_net(self.M, self.ks, self.pad, i+1) for i in range(self.bits - 1 + linear_codes_size)])
+
         means_shape = [1, *self.img_shape]
         means_shape[1] = 1
         lin_mean = torch.zeros(means_shape)
