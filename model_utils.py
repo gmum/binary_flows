@@ -657,8 +657,10 @@ class BinaryFlowGroupARM(nn.Module):
         nets = create_binary_flows_nets(bits=self.bits, architecture=self.architecture, M=self.M, ks=self.ks, pad=self.pad, linear_codes=self.linear_codes, conditional=self.conditional, conditional_classes=self.conditional_classes)
 
         # parameterization
-        self.t_a = torch.nn.ModuleList([nets[0]() for _ in range(self.num_flows)])
-        self.t_b = torch.nn.ModuleList([nets[1]() for _ in range(self.num_flows)])
+        # self.t_a = torch.nn.ModuleList([nets[0]() for _ in range(self.num_flows)])
+        # self.t_b = torch.nn.ModuleList([nets[1]() for _ in range(self.num_flows)])
+        self.t_a = None
+        self.t_b = None
 
         # self.net_base = net_base
         self.base_distribution = base_distribution
@@ -700,12 +702,16 @@ class BinaryFlowGroupARM(nn.Module):
         else:
             # forward
             if forward:
-                ya = self.xor(xa, self.t_a[index](xb))
-                yb = self.xor(xb, self.t_b[index](ya))
+                ya = xa
+                yb = xb
+                # ya = self.xor(xa, self.t_a[index](xb))
+                # yb = self.xor(xb, self.t_b[index](ya))
             # inverse
             else:
-                yb = self.xor(xb, self.t_b[index](xa))
-                ya = self.xor(xa, self.t_a[index](yb))
+                yb = xb
+                ya = xa
+                # yb = self.xor(xb, self.t_b[index](xa))
+                # ya = self.xor(xa, self.t_a[index](yb))
 
         return torch.cat((ya, yb), 1)
 
