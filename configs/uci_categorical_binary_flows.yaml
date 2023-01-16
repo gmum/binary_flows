@@ -26,8 +26,8 @@ transformer_dropout: 0.0
 
 binary_flows: True
 bf:
-  architecture: cnn
-  num_flows: 8
+  architecture: mlp
+  num_flows: 16
   M: 128
   ks: 3
   pad: 1
@@ -58,11 +58,12 @@ resampled:
   hdims: [256, 256]
 
 arbernoulli:
-  M: 128
+  M: 64
   ks: 3
   pad: 1
   conditional: False
   conditional_classes: 8
+  architecture: mlp
 
 iterations: 200000
 batch_size: 64

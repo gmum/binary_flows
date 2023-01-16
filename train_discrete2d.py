@@ -478,7 +478,8 @@ class Workspace:
         if self.cfg.binary_flows is not True:
             print(self.vardeq_model)
 
-        self.optimizer = optim.Adam(self.all_parameters, lr=self.cfg.lr)
+        # self.optimizer = optim.Adam(self.all_parameters, lr=self.cfg.lr)
+        self.optimizer = optim.AdamW(self.all_parameters, lr=self.cfg.lr)
 
         self.loss_meter = utils.RunningAverageMeter(0.99)
         self.model_logprob_meter = utils.RunningAverageMeter(0.9)

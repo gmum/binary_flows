@@ -331,7 +331,10 @@ class Workspace:
             elif self.cfg.base == "arbernoulli":
                 # TODO - add our distribution!!!
                 # TODO - check!!!
-                img_shape = (1, 1, self.num_discrete_variables)
+                if self.cfg.bf.architecture == 'cnn':
+                    img_shape = (1, 1, self.num_discrete_variables)
+                else:
+                    img_shape = (1, self.num_discrete_variables)
                 return SemiAutoregressiveBernoulliDistribution(img_shape,
                                                                self.cfg.arbernoulli.M,
                                                                self.cfg.arbernoulli.ks,
@@ -339,14 +342,19 @@ class Workspace:
                                                                self.cfg.bits,
                                                                self.cfg.arbernoulli.conditional,
                                                                self.cfg.arbernoulli.conditional_classes,
-                                                               self.cfg.linear_codes).to(self.device)
+                                                               self.cfg.linear_codes,
+                                                               self.cfg.arbernoulli.architecture,
+                                                               log).to(self.device)
             else:
                 raise ValueError(f"Unknown base option {self.cfg.base}")
 
         if self.cfg.binary_flows == True:
             # create binary flows model, otherwise check dequantization
             # TODO - add my model !!!
-            self.img_shape = (1, 1, self.num_discrete_variables)
+            if self.cfg.bf.architecture == 'cnn':
+                self.img_shape = (1, 1, self.num_discrete_variables)
+            else:
+                self.img_shape = (1, self.num_discrete_variables)
             transforms = get_transforms(img_shape=self.img_shape,
                                         bits=self.cfg.bits,
                                         linear_codes=self.cfg.linear_codes)
@@ -360,6 +368,7 @@ class Workspace:
                                             pad=self.cfg.bf.pad,
                                             conditional=self.cfg.bf.conditional,
                                             conditional_classes=self.cfg.bf.conditional_classes,
+                                            discrete_variables=self.num_discrete_variables,
                                             log=log).to(self.device)
             self.all_parameters = set(list(self.model.parameters()))
         else:

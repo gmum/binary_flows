@@ -136,6 +136,7 @@ class Workspace:
         if self.current_epoch > 0:
             return train_loader, valid_loader, test_loader
 
+        #TODO - add Binary Flows model
         model = get_model(
             self.cfg, args, data_shape=data_shape, num_classes=num_classes
         )

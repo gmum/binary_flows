@@ -8,10 +8,13 @@ model: ar
 dequantization: voronoi  # {voronoi, argmax}
 embedding_dim: 5
 logfreq: 20
+binary_flows: True
 
 # The rest are fixed. These arguments are taken from argmax flows and are dependent.
 
 text8:
+  binary_flows:
+
   ar:
     dataset: ${dataset}
     model: ${model}
@@ -156,10 +159,11 @@ hydra:
     dir: ./exp/charlm/${now:%Y.%m.%d}/${now:%H%M%S}
     subdir: ${hydra.job.num}
   launcher:
-    max_num_timeout: 100000
-    timeout_min: 4319
-    partition: learnfair
+#    max_num_timeout: 100000
+#    timeout_min: 4319
+#    partition: learnfair
     mem_gb: 64
-    cpus_per_task: 10
+#    cpus_per_task: 10
+    cpus_per_task: 1
     gpus_per_node: 1
-    constraint: volta32gb
+#    constraint: volta32gb

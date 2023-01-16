@@ -1,5 +1,6 @@
 defaults:
-  - override hydra/launcher: submitit_slurm
+#  - override hydra/launcher: submitit_slurm
+  - override hydra/launcher: submitit_local
 
 sweep:
   n_sample: 100
@@ -9,6 +10,7 @@ seed: 0
 n_resumes: 5
 
 # dataset should be one of {mushroom,nursery,connect4,uscensus90,pokerhand,forests}
+binary_flows: False
 dataset: mushroom
 flow_type: coupling  # {coupling,autoreg}
 num_flows: 16
@@ -61,9 +63,9 @@ hydra:
     dir: ./exp/uci_categorical/${dataset}/${dequantization}/${now:%Y.%m.%d}/${now:%H%M%S}
     subdir: ${hydra.job.num}
   launcher:
-    max_num_timeout: 100000
-    timeout_min: 4319
-    partition: learnfair
+#    max_num_timeout: 100000
+#    timeout_min: 4319
+#    partition: learnfair
     mem_gb: 64
-    cpus_per_task: 10
+    cpus_per_task: 1
     gpus_per_node: 1

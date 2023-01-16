@@ -21,7 +21,7 @@ import voronoi
 import argmax_utils
 
 
-def single_net(M, ks, pad, ch=1):
+def single_net_cnn(M, ks, pad, ch=1):
     net = nn.Sequential(nn.Conv2d(ch, M, kernel_size=ks, padding=pad, stride=1),
                         nn.GELU(),
                         nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
@@ -33,7 +33,7 @@ def single_net(M, ks, pad, ch=1):
     return net
 
 
-def single_net_conditional(M, ks, pad, conditional_classes, ch=1):
+def single_net_conditional_cnn(M, ks, pad, conditional_classes, ch=1):
     net = nn.Sequential(nn.Conv2d(ch+conditional_classes, M, kernel_size=ks, padding=pad, stride=1),
                         nn.GELU(),
                         nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
@@ -41,6 +41,30 @@ def single_net_conditional(M, ks, pad, conditional_classes, ch=1):
                         nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
                         nn.GELU(),
                         nn.Conv2d(M, 1, kernel_size=ks, padding=pad, stride=1),
+                        nn.Sigmoid(),)
+    return net
+
+
+def single_net_mlp(M, ch=1):
+    net = nn.Sequential(nn.Linear(ch, M),
+                        nn.GELU(),
+                        nn.Linear(M, M),
+                        nn.GELU(),
+                        nn.Linear(M, M),
+                        nn.GELU(),
+                        nn.Linear(M, 1, ),
+                        nn.Sigmoid(),)
+    return net
+
+
+def single_net_conditional_mlp(M, conditional_classes, ch=1):
+    net = nn.Sequential(nn.Linear(ch + conditional_classes, M),
+                        nn.GELU(),
+                        nn.Linear(M, M),
+                        nn.GELU(),
+                        nn.Linear(M, M),
+                        nn.GELU(),
+                        nn.Linear(M, 1, ),
                         nn.Sigmoid(),)
     return net
 
@@ -150,7 +174,7 @@ class StepSTE(nn.Module):
         return y + 0.5 * (torch.sign(x + 1.e-7).detach() + 1.) - y.detach()
 
 
-def create_binary_flows_nets(bits=8, architecture='cnn', M=32, ks=3, pad=1, linear_codes=False, conditional=False, conditional_classes=8):
+def create_binary_flows_nets(bits=8, architecture='cnn', M=32, ks=3, pad=1, linear_codes=False, conditional=False, conditional_classes=8, discrete_variables=21):
     if architecture == 'cnn':
 
         net_a = lambda: nn.Sequential(nn.Conv2d(bits, M, kernel_size=ks, padding=pad, stride=1),
@@ -217,7 +241,7 @@ def create_binary_flows_nets(bits=8, architecture='cnn', M=32, ks=3, pad=1, line
                                                                   nn.Conv2d(M, bits//2, kernel_size=1, padding=0, stride=1),
                                                                   StepSTE(threshold=0.5))
 
-        conditional_net_b_no_linear_codes = lambda: nn.Sequential(nn.Conv2d(8+conditional_classes, M, kernel_size=ks, padding=pad, stride=1),
+        conditional_net_b_no_linear_codes = lambda: nn.Sequential(nn.Conv2d(bits+conditional_classes, M, kernel_size=ks, padding=pad, stride=1),
                                                                   nn.GELU(),
                                                                   nn.Conv2d(M, M, kernel_size=ks, padding=pad, stride=1),
                                                                   nn.GELU(),
@@ -226,16 +250,90 @@ def create_binary_flows_nets(bits=8, architecture='cnn', M=32, ks=3, pad=1, line
                                                                   nn.Conv2d(M, bits//2, kernel_size=1, padding=0, stride=1),
                                                                   StepSTE(threshold=0.5))
 
-        if linear_codes:
-            if conditional == True:
-                nets = [conditional_net_a, conditional_net_b]
-            else:
-                nets = [net_a, net_b]
+    else:
+        net_a = lambda: nn.Sequential(nn.Linear(int(discrete_variables * bits), M),
+                                      nn.GELU(),
+                                      nn.Linear(M, M),
+                                      nn.GELU(),
+                                      nn.Linear(M, M),
+                                      nn.GELU(),
+                                      nn.Linear(M, int(discrete_variables * bits)),
+                                      StepSTE(threshold=0.5))
+
+        net_b = lambda: nn.Sequential(nn.Linear(int(discrete_variables * bits), M),
+                                      nn.GELU(),
+                                      nn.Linear(M, M),
+                                      nn.GELU(),
+                                      nn.Linear(M, M),
+                                      nn.GELU(),
+                                      nn.Linear(M, int(discrete_variables * bits)),
+                                      StepSTE(threshold=0.5))
+
+        net_a_no_linear_codes = lambda: nn.Sequential(nn.Linear(int(discrete_variables * bits//2), M),
+                                                      nn.GELU(),
+                                                      nn.Linear(M, M),
+                                                      nn.GELU(),
+                                                      nn.Linear(M, M),
+                                                      nn.GELU(),
+                                                      nn.Linear(M, int(discrete_variables * bits//2)),
+                                                      StepSTE(threshold=0.5))
+
+        net_b_no_linear_codes = lambda: nn.Sequential(nn.Linear(int(discrete_variables * bits//2), M),
+                                                      nn.GELU(),
+                                                      nn.Linear(M, M),
+                                                      nn.GELU(),
+                                                      nn.Linear(M, M),
+                                                      nn.GELU(),
+                                                      nn.Linear(M, int(discrete_variables * bits//2)),
+                                                      StepSTE(threshold=0.5))
+
+        #TODO!!! - create conditional_net_a and conditional_net_b
+        conditional_net_a = lambda: nn.Sequential(nn.Linear(int(discrete_variables * bits//2) + conditional_classes, M),
+                                                  nn.GELU(),
+                                                  nn.Linear(M, M),
+                                                  nn.GELU(),
+                                                  nn.Linear(M, M),
+                                                  nn.GELU(),
+                                                  nn.Linear(M, int(discrete_variables * bits//2)),
+                                                  StepSTE(threshold=0.5))
+
+        conditional_net_b = lambda: nn.Sequential(nn.Linear(int(discrete_variables * bits//2) + conditional_classes, M),
+                                                  nn.GELU(),
+                                                  nn.Linear(M, M),
+                                                  nn.GELU(),
+                                                  nn.Linear(M, M),
+                                                  nn.GELU(),
+                                                  nn.Linear(M, int(discrete_variables * bits//2)),
+                                                  StepSTE(threshold=0.5))
+
+        conditional_net_a_no_linear_codes = lambda: nn.Sequential(nn.Linear(int(discrete_variables * bits) + conditional_classes, M),
+                                                                  nn.GELU(),
+                                                                  nn.Linear(M, M),
+                                                                  nn.GELU(),
+                                                                  nn.Linear(M, M),
+                                                                  nn.GELU(),
+                                                                  nn.Linear(M, int(discrete_variables * bits//2)),
+                                                                  StepSTE(threshold=0.5))
+
+        conditional_net_b_no_linear_codes = lambda: nn.Sequential(nn.Linear(int(discrete_variables * bits) + conditional_classes, M),
+                                                                  nn.GELU(),
+                                                                  nn.Linear(M, M),
+                                                                  nn.GELU(),
+                                                                  nn.Linear(M, M),
+                                                                  nn.GELU(),
+                                                                  nn.Linear(M, int(discrete_variables * bits//2)),
+                                                                  StepSTE(threshold=0.5))
+
+    if linear_codes:
+        if conditional == True:
+            nets = [conditional_net_a, conditional_net_b]
         else:
-            if conditional == True:
-                nets = [conditional_net_a_no_linear_codes, conditional_net_b_no_linear_codes]
-            else:
-                nets = [net_a_no_linear_codes, net_b_no_linear_codes]
+            nets = [net_a, net_b]
+    else:
+        if conditional == True:
+            nets = [conditional_net_a_no_linear_codes, conditional_net_b_no_linear_codes]
+        else:
+            nets = [net_a_no_linear_codes, net_b_no_linear_codes]
 
     return nets
 
@@ -280,7 +378,7 @@ class ConditionalGaussianDistribution(nn.Module):
 
 
 class SemiAutoregressiveBernoulliDistribution(nn.Module):
-    def __init__(self, img_shape, M=32, ks=3, pad=1, bits=8, conditional=False, conditional_classes=8, linear_codes=False):
+    def __init__(self, img_shape, M=32, ks=3, pad=1, bits=8, conditional=False, conditional_classes=8, linear_codes=False, architecture='cnn', log=None):
         super().__init__()
         self.img_shape = img_shape
         self.M = M
@@ -290,11 +388,20 @@ class SemiAutoregressiveBernoulliDistribution(nn.Module):
         self.conditional_classes = conditional_classes
         self.linear_codes = linear_codes
         self.bits = bits
+        self.architecture = architecture
+        self.log = log
         linear_codes_size = 8 if self.linear_codes else 0
-        if self.conditional:
-            self.net_base = torch.nn.ModuleList([single_net_conditional(self.M, self.ks, self.pad, i+1) for i in range(self.bits - 1 + linear_codes_size + self.conditional_classes)])
+
+        if self.architecture == 'cnn':
+            if self.conditional:
+                self.net_base = torch.nn.ModuleList([single_net_conditional_cnn(self.M, self.ks, self.pad, i+1) for i in range(self.bits - 1 + linear_codes_size + self.conditional_classes)])
+            else:
+                self.net_base = torch.nn.ModuleList([single_net_cnn(self.M, self.ks, self.pad, i+1) for i in range(self.bits - 1 + linear_codes_size)])
         else:
-            self.net_base = torch.nn.ModuleList([single_net(self.M, self.ks, self.pad, i+1) for i in range(self.bits - 1 + linear_codes_size)])
+            if self.conditional:
+                self.net_base = torch.nn.ModuleList([single_net_conditional_mlp(self.M, i+1) for i in range(self.bits - 1 + linear_codes_size + self.conditional_classes)])
+            else:
+                self.net_base = torch.nn.ModuleList([single_net_mlp(self.M, i+1) for i in range(self.bits - 1 + linear_codes_size)])
 
         means_shape = [1, *self.img_shape]
         means_shape[1] = 1
@@ -304,9 +411,13 @@ class SemiAutoregressiveBernoulliDistribution(nn.Module):
     def _log_base(self, x, context=None):
         # TODO - check!!!
         # calculate probs:
+        # if len(x.shape) == 3:
+        #     x = torch.unsqueeze(x, 1)
         probs = torch.sigmoid(self.lin_mean)
         ones = [1] * (len(self.img_shape))
         probs = probs.repeat(x.shape[0], *ones)
+        # if len(probs.shape) == 3:
+        #     probs = torch.unsqueeze(probs, 1)
 
         if context is not None:
             for i in range(len(self.net_base)):
@@ -317,7 +428,18 @@ class SemiAutoregressiveBernoulliDistribution(nn.Module):
                 probs = torch.cat((probs, p_i), 1)
         else:
             for i in range(len(self.net_base)):
+                # self.log.info(f"x[:, 0:i+1]")
+                # self.log.info(f"{x[:, 0:i+1]}")
+                # self.log.info(f"{x[:, 0:i+1].shape}")
                 p_i = self.net_base[i](x[:, 0:i+1])
+                #
+                # p_i = p_i.transpose(1, 2)
+                # self.log.info(f"p_i")
+                # self.log.info(f"{p_i}")
+                # self.log.info(f"{p_i.shape}")
+                # self.log.info(f"probs")
+                # self.log.info(f"{probs}")
+                # self.log.info(f"{probs.shape}")
                 probs = torch.cat((probs, p_i), 1)
 
         probs = torch.clamp(probs, 1.e-7, 1. - 1.e-7)
@@ -641,7 +763,7 @@ class BinaryFlow(nn.Module):
 
 
 class BinaryFlowGroupARM(nn.Module):
-    def __init__(self, base_distribution, linear_codes=False, bits=8, architecture="cnn", num_flows=8, M=32, ks=3, pad=1, conditional=False, conditional_classes=8, log=None):
+    def __init__(self, base_distribution, linear_codes=False, bits=8, architecture="cnn", num_flows=8, M=32, ks=3, pad=1, conditional=False, conditional_classes=8, discrete_variables=20, log=None):
         super(BinaryFlowGroupARM, self).__init__()
 
         self.architecture = architecture
@@ -654,7 +776,7 @@ class BinaryFlowGroupARM(nn.Module):
         self.conditional = conditional
         self.conditional_classes = conditional_classes
 
-        nets = create_binary_flows_nets(bits=self.bits, architecture=self.architecture, M=self.M, ks=self.ks, pad=self.pad, linear_codes=self.linear_codes, conditional=self.conditional, conditional_classes=self.conditional_classes)
+        nets = create_binary_flows_nets(bits=self.bits, architecture=self.architecture, M=self.M, ks=self.ks, pad=self.pad, linear_codes=self.linear_codes, conditional=self.conditional, conditional_classes=self.conditional_classes, discrete_variables=discrete_variables)
 
         # parameterization
         self.t_a = torch.nn.ModuleList([nets[0]() for _ in range(self.num_flows)])
@@ -676,7 +798,17 @@ class BinaryFlowGroupARM(nn.Module):
     # Flow-related functions
     def coupling(self, x, index, forward=True, context=None):
         # divide into two parts
-        (xa, xb) = torch.chunk(x, 2, dim=1)
+        if self.architecture == 'cnn':
+            (xa, xb) = torch.chunk(x, 2, dim=1)
+        else:
+            self.log.info(f"x")
+            self.log.info(f"{x}")
+            self.log.info(f"{x.shape}")
+            (xa, xb) = torch.chunk(x, 2, dim=1)
+            xa_shape = xa.shape
+            xb_shape = xb.shape
+            xa = torch.flatten(xa, start_dim=1)
+            xb = torch.flatten(xb, start_dim=1)
 
         if context is not None:
             extended_context = context.repeat(1, 1, 2).reshape((context.shape[0], 4, 1, 2))
@@ -700,6 +832,13 @@ class BinaryFlowGroupARM(nn.Module):
         else:
             # forward
             if forward:
+                self.log.info(f"xa")
+                self.log.info(f"{xa}")
+                self.log.info(f"{xa.shape}")
+                self.log.info(f"xb")
+                self.log.info(f"{xb}")
+                self.log.info(f"{xb.shape}")
+
                 ya = self.xor(xa, self.t_a[index](xb))
                 yb = self.xor(xb, self.t_b[index](ya))
             # inverse
@@ -707,7 +846,24 @@ class BinaryFlowGroupARM(nn.Module):
                 yb = self.xor(xb, self.t_b[index](xa))
                 ya = self.xor(xa, self.t_a[index](yb))
 
-        return torch.cat((ya, yb), 1)
+        if self.architecture == 'cnn':
+            return torch.cat((ya, yb), 1)
+        else:
+            #TODO - check!!!
+            ya = torch.reshape(ya, xa_shape)
+            yb = torch.reshape(yb, xb_shape)
+            self.log.info(f"ya")
+            self.log.info(f"{ya}")
+            self.log.info(f"{ya.shape}")
+            self.log.info(f"yb")
+            self.log.info(f"{yb}")
+            self.log.info(f"{yb.shape}")
+            # ya = torch.unflatten(ya, 1, xa_unflatten_shape)
+            # yb = torch.unflatten(yb, 1, xb_unflatten_shape)
+            self.log.info(f"y")
+            self.log.info(f"{torch.cat((ya, yb), 1)}")
+            self.log.info(f"{torch.cat((ya, yb), 1).shape}")
+            return torch.cat((ya, yb), 1)
 
     def f(self, x, context=None):
         z = x
