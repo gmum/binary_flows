@@ -19,6 +19,8 @@ import layers
 from layers.made import MADE
 import voronoi
 import argmax_utils
+# from difflogic.difflogic import LogicLayer, GroupSum
+from difflogic import LogicLayer, GroupSum
 
 
 def single_net(M, ks, pad, ch=1):
@@ -43,6 +45,29 @@ def single_net_conditional(M, ks, pad, conditional_classes, ch=1):
                         nn.Conv2d(M, 1, kernel_size=ks, padding=pad, stride=1),
                         nn.Sigmoid(),)
     return net
+
+
+def single_net_mlp(M, img_shape, ch=1):
+    net = nn.Sequential(nn.Linear(in_features=ch*(img_shape[-1] * img_shape[-2]), out_features=M),
+                        nn.GELU(),
+                        nn.Linear(in_features=M, out_features=M),
+                        nn.GELU(),
+                        nn.Linear(in_features=M, out_features=M),
+                        nn.GELU(),
+                        nn.Linear(in_features=M, out_features=1*(img_shape[-1] * img_shape[-2])),
+                        nn.Sigmoid(),)
+    return net
+
+
+def single_net_logic(M, img_shape, tau, grad_factor, ch=1):
+    net = nn.Sequential(LogicLayer(in_dim=ch*(img_shape[-1] * img_shape[-2]), out_dim=M, grad_factor=grad_factor),
+                        LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
+                        LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
+                        LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
+                        LogicLayer(in_dim=M, out_dim=32*(img_shape[-1] * img_shape[-2]), grad_factor=grad_factor),
+                        GroupSum(k=1*(img_shape[-1] * img_shape[-2]), tau=tau))
+    return net
+
 
 
 def standard_normal_sample(size):
@@ -150,7 +175,7 @@ class StepSTE(nn.Module):
         return y + 0.5 * (torch.sign(x + 1.e-7).detach() + 1.) - y.detach()
 
 
-def create_binary_flows_nets(bits=8, architecture='cnn', M=32, ks=3, pad=1, linear_codes=False, conditional=False, conditional_classes=8):
+def create_binary_flows_nets(bits=8, architecture='cnn', M=32, ks=3, pad=1, linear_codes=False, conditional=False, conditional_classes=8, img_shape=(1, 28, 28), tau=30.0, grad_factor=2.0):
     if architecture == 'cnn':
 
         net_a = lambda: nn.Sequential(nn.Conv2d(bits, M, kernel_size=ks, padding=pad, stride=1),
@@ -237,6 +262,86 @@ def create_binary_flows_nets(bits=8, architecture='cnn', M=32, ks=3, pad=1, line
             else:
                 nets = [net_a_no_linear_codes, net_b_no_linear_codes]
 
+    elif architecture == 'mlp':
+        net_a = lambda: nn.Sequential(nn.Linear(in_features=bits*(img_shape[-1] * img_shape[-2]), out_features=M),
+                                      nn.GELU(),
+                                      nn.Linear(in_features=M, out_features=M),
+                                      nn.GELU(),
+                                      nn.Linear(in_features=M, out_features=M),
+                                      nn.GELU(),
+                                      nn.Linear(in_features=M, out_features=bits*(img_shape[-1] * img_shape[-2])),
+                                      StepSTE(threshold=0.5))
+
+        net_b = lambda: nn.Sequential(nn.Linear(in_features=bits*(img_shape[-1] * img_shape[-2]), out_features=M),
+                                      nn.GELU(),
+                                      nn.Linear(in_features=M, out_features=M),
+                                      nn.GELU(),
+                                      nn.Linear(in_features=M, out_features=M),
+                                      nn.GELU(),
+                                      nn.Linear(in_features=M, out_features=bits*(img_shape[-1] * img_shape[-2])),
+                                      StepSTE(threshold=0.5))
+
+        net_a_no_linear_codes = lambda: nn.Sequential(nn.Linear(in_features=(bits//2)*(img_shape[-1] * img_shape[-2]), out_features=M),
+                                      nn.GELU(),
+                                      nn.Linear(in_features=M, out_features=M),
+                                      nn.GELU(),
+                                      nn.Linear(in_features=M, out_features=M),
+                                      nn.GELU(),
+                                      nn.Linear(in_features=M, out_features=(bits//2)*(img_shape[-1] * img_shape[-2])),
+                                      StepSTE(threshold=0.5))
+
+        net_b_no_linear_codes = lambda: nn.Sequential(nn.Linear(in_features=(bits//2)*(img_shape[-1] * img_shape[-2]), out_features=M),
+                                      nn.GELU(),
+                                      nn.Linear(in_features=M, out_features=M),
+                                      nn.GELU(),
+                                      nn.Linear(in_features=M, out_features=M),
+                                      nn.GELU(),
+                                      nn.Linear(in_features=M, out_features=(bits//2)*(img_shape[-1] * img_shape[-2])),
+                                      StepSTE(threshold=0.5))
+
+        if linear_codes:
+                nets = [net_a, net_b]
+        else:
+                nets = [net_a_no_linear_codes, net_b_no_linear_codes]
+
+    elif architecture == 'logic':
+        net_a = lambda: nn.Sequential(LogicLayer(in_dim=bits*(img_shape[-1] * img_shape[-2]), out_dim=M, grad_factor=grad_factor),
+                                      LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
+                                      LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
+                                      LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
+                                      LogicLayer(in_dim=M, out_dim=4*bits*(img_shape[-1] * img_shape[-2]), grad_factor=grad_factor),
+                                      GroupSum(k=bits*(img_shape[-1] * img_shape[-2]), tau=tau))
+
+        net_b = lambda: nn.Sequential(LogicLayer(in_dim=bits*(img_shape[-1] * img_shape[-2]), out_dim=M, grad_factor=grad_factor),
+                                      LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
+                                      LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
+                                      LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
+                                      LogicLayer(in_dim=M, out_dim=4*bits*(img_shape[-1] * img_shape[-2]), grad_factor=grad_factor),
+                                      GroupSum(k=bits*(img_shape[-1] * img_shape[-2]), tau=tau))
+
+        net_a_no_linear_codes = lambda: nn.Sequential(LogicLayer(in_dim=(bits//2)*(img_shape[-1] * img_shape[-2]), out_dim=M, grad_factor=grad_factor),
+                                      LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
+                                      LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
+                                      LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
+                                      LogicLayer(in_dim=M, out_dim=4*(bits//2)*(img_shape[-1] * img_shape[-2]), grad_factor=grad_factor),
+                                      GroupSum(k=(bits//2)*(img_shape[-1] * img_shape[-2]), tau=tau))
+
+        net_b_no_linear_codes = lambda: nn.Sequential(LogicLayer(in_dim=(bits//2)*(img_shape[-1] * img_shape[-2]), out_dim=M, grad_factor=grad_factor),
+                                                      LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
+                                                      LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
+                                                      LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
+                                                      LogicLayer(in_dim=M, out_dim=4*(bits//2)*(img_shape[-1] * img_shape[-2]), grad_factor=grad_factor),
+                                                      GroupSum(k=(bits//2)*(img_shape[-1] * img_shape[-2]), tau=tau))
+
+        if linear_codes:
+            nets = [net_a, net_b]
+        else:
+            nets = [net_a_no_linear_codes, net_b_no_linear_codes]
+
+    else:
+        nets = None
+        pass
+
     return nets
 
 
@@ -280,7 +385,7 @@ class ConditionalGaussianDistribution(nn.Module):
 
 
 class SemiAutoregressiveBernoulliDistribution(nn.Module):
-    def __init__(self, img_shape, M=32, ks=3, pad=1, bits=8, conditional=False, conditional_classes=8, linear_codes=False):
+    def __init__(self, img_shape, M=32, ks=3, pad=1, bits=8, conditional=False, conditional_classes=8, linear_codes=False, architecture='cnn', tau=30.0, grad_factor=2.0):
         super().__init__()
         self.img_shape = img_shape
         self.M = M
@@ -291,21 +396,50 @@ class SemiAutoregressiveBernoulliDistribution(nn.Module):
         self.linear_codes = linear_codes
         self.bits = bits
         linear_codes_size = 8 if self.linear_codes else 0
-        if self.conditional:
-            self.net_base = torch.nn.ModuleList([single_net_conditional(self.M, self.ks, self.pad, i+1) for i in range(self.bits - 1 + linear_codes_size + self.conditional_classes)])
-        else:
-            self.net_base = torch.nn.ModuleList([single_net(self.M, self.ks, self.pad, i+1) for i in range(self.bits - 1 + linear_codes_size)])
 
-        means_shape = [1, *self.img_shape]
-        means_shape[1] = 1
+        self.architecture = architecture
+        self.tau = tau
+        self.grad_factor = grad_factor
+
+        if self.architecture == 'cnn':
+            if self.conditional:
+                self.net_base = torch.nn.ModuleList([single_net_conditional(self.M, self.ks, self.pad, i+1) for i in range(self.bits - 1 + linear_codes_size + self.conditional_classes)])
+            else:
+                self.net_base = torch.nn.ModuleList([single_net(self.M, self.ks, self.pad, i+1) for i in range(self.bits - 1 + linear_codes_size)])
+        elif self.architecture == 'mlp':
+            self.net_base = torch.nn.ModuleList([single_net_mlp(self.M, self.img_shape, i+1) for i in range(self.bits - 1 + linear_codes_size)])
+        elif self.architecture == 'logic':
+            self.net_base = torch.nn.ModuleList([single_net_logic(self.M, self.img_shape, self.tau, self.grad_factor, i+1) for i in range(self.bits - 1 + linear_codes_size)])
+        else:
+            self.net_base = None
+
+        if self.architecture == 'cnn':
+            means_shape = [1, *self.img_shape]
+            means_shape[1] = 1
+        else:
+            means_shape = [1, self.img_shape[-1] * self.img_shape[-2]]
+
         lin_mean = torch.zeros(means_shape)
         self.lin_mean = nn.Parameter(lin_mean)
 
     def _log_base(self, x, context=None):
         # TODO - check!!!
         # calculate probs:
+        #for mlp and logic
+        x_0, x_1, x_2, x_3 = x.size()
+
+        if self.architecture != 'cnn':
+            x = torch.reshape(x, [x_0, x_1*x_2*x_3])
+
         probs = torch.sigmoid(self.lin_mean)
-        ones = [1] * (len(self.img_shape))
+
+        if self.architecture == 'cnn':
+            ones = [1] * (len(self.img_shape))
+            k_size = 1
+        else:
+            ones = [1]  #* 2
+            k_size = x_2 * x_3
+
         probs = probs.repeat(x.shape[0], *ones)
 
         if context is not None:
@@ -317,7 +451,7 @@ class SemiAutoregressiveBernoulliDistribution(nn.Module):
                 probs = torch.cat((probs, p_i), 1)
         else:
             for i in range(len(self.net_base)):
-                p_i = self.net_base[i](x[:, 0:i+1])
+                p_i = self.net_base[i](x[:, 0:(i+1)*k_size])
                 probs = torch.cat((probs, p_i), 1)
 
         probs = torch.clamp(probs, 1.e-7, 1. - 1.e-7)
@@ -335,7 +469,12 @@ class SemiAutoregressiveBernoulliDistribution(nn.Module):
         # FIRST PLANE
         # Calculating probabilities
         probs = torch.sigmoid(self.lin_mean).to(device)
-        ones = [1] * (len(self.img_shape))
+
+        if self.architecture == 'cnn':
+            ones = [1] * (len(self.img_shape))
+        else:
+            ones = [1]
+
         probs = probs.repeat(num_samples, *ones)
         # Sampling from the base distribution
         z = torch.bernoulli(probs).to(device)
@@ -351,6 +490,14 @@ class SemiAutoregressiveBernoulliDistribution(nn.Module):
             for i in range(len(self.net_base)):
                 z_i = torch.bernoulli(self.net_base[i](z))
                 z = torch.cat((z, z_i), 1)
+
+        if self.architecture != 'cnn':
+            batch, _ = z.size()
+            # TODO - potentially change!
+            # N = 16
+            N = 16 if self.linear_codes else self.bits
+            z = torch.reshape(z, [batch, N, self.img_shape[1], self.img_shape[2]])
+
         # TODO - check!!!
         log_p = z * torch.log(probs) + (1. - z) * torch.log(1. - probs)
         return z, log_p
@@ -641,7 +788,7 @@ class BinaryFlow(nn.Module):
 
 
 class BinaryFlowGroupARM(nn.Module):
-    def __init__(self, base_distribution, linear_codes=False, bits=8, architecture="cnn", num_flows=8, M=32, ks=3, pad=1, conditional=False, conditional_classes=8, log=None):
+    def __init__(self, base_distribution, linear_codes=False, bits=8, architecture="cnn", num_flows=8, M=32, ks=3, pad=1, conditional=False, conditional_classes=8, log=None, img_shape=(1, 28, 28), tau=30.0, grad_factor=2.0):
         super(BinaryFlowGroupARM, self).__init__()
 
         self.architecture = architecture
@@ -654,7 +801,11 @@ class BinaryFlowGroupARM(nn.Module):
         self.conditional = conditional
         self.conditional_classes = conditional_classes
 
-        nets = create_binary_flows_nets(bits=self.bits, architecture=self.architecture, M=self.M, ks=self.ks, pad=self.pad, linear_codes=self.linear_codes, conditional=self.conditional, conditional_classes=self.conditional_classes)
+        self.img_shape = img_shape
+        self.tau = tau
+        self.grad_factor = grad_factor
+
+        nets = create_binary_flows_nets(bits=self.bits, architecture=self.architecture, M=self.M, ks=self.ks, pad=self.pad, linear_codes=self.linear_codes, conditional=self.conditional, conditional_classes=self.conditional_classes, img_shape=self.img_shape, tau=self.tau, grad_factor=self.grad_factor)
 
         # parameterization
         self.t_a = torch.nn.ModuleList([nets[0]() for _ in range(self.num_flows)])
@@ -677,6 +828,13 @@ class BinaryFlowGroupARM(nn.Module):
     def coupling(self, x, index, forward=True, context=None):
         # divide into two parts
         (xa, xb) = torch.chunk(x, 2, dim=1)
+
+        xa_0, xa_1, xa_2, xa_3 = xa.size()
+        xb_0, xb_1, xb_2, xb_3 = xb.size()
+
+        if self.architecture != 'cnn':
+            xa = torch.reshape(xa, [xa_0, xa_1*xa_2*xa_3])
+            xb = torch.reshape(xb, [xb_0, xb_1*xb_2*xb_3])
 
         if context is not None:
             extended_context = context.repeat(1, 1, 2).reshape((context.shape[0], 4, 1, 2))
@@ -706,6 +864,10 @@ class BinaryFlowGroupARM(nn.Module):
             else:
                 yb = self.xor(xb, self.t_b[index](xa))
                 ya = self.xor(xa, self.t_a[index](yb))
+
+        if self.architecture != 'cnn':
+            ya = torch.reshape(ya, [xa_0, xa_1, xa_2, xa_3])
+            yb = torch.reshape(yb, [xb_0, xb_1, xb_2, xb_3])
 
         return torch.cat((ya, yb), 1)
 

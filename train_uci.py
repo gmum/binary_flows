@@ -339,7 +339,10 @@ class Workspace:
                                                                self.cfg.bits,
                                                                self.cfg.arbernoulli.conditional,
                                                                self.cfg.arbernoulli.conditional_classes,
-                                                               self.cfg.linear_codes).to(self.device)
+                                                               self.cfg.linear_codes,
+                                                               self.cfg.arbernoulli.architecture,
+                                                               self.cfg.arbernoulli.tau,
+                                                               self.cfg.arbernoulli.grad_factor).to(self.device)
             else:
                 raise ValueError(f"Unknown base option {self.cfg.base}")
 
@@ -360,7 +363,10 @@ class Workspace:
                                             pad=self.cfg.bf.pad,
                                             conditional=self.cfg.bf.conditional,
                                             conditional_classes=self.cfg.bf.conditional_classes,
-                                            log=log).to(self.device)
+                                            log=log,
+                                            img_shape=self.img_shape,
+                                            tau=self.cfg.bf.tau,
+                                            grad_factor=self.cfg.bf.grad_factor).to(self.device)
             self.all_parameters = set(list(self.model.parameters()))
         else:
             if self.cfg.dequantization == "simplex":

@@ -26,13 +26,16 @@ transformer_dropout: 0.0
 
 binary_flows: True
 bf:
-  architecture: cnn
+  architecture: mlp #else: logic, mlp
   num_flows: 8
-  M: 128
+#  M: 128
+  M: 512
   ks: 3
   pad: 1
   conditional: False
   conditional_classes: 8
+  tau: 30.0
+  grad_factor: 2.0
 linear_codes: False
 #bits: 8
 bits: 4
@@ -58,11 +61,15 @@ resampled:
   hdims: [256, 256]
 
 arbernoulli:
-  M: 128
+  architecture: mlp #else: logic, mlp
+#  M: 128
+  M: 512
   ks: 3
   pad: 1
   conditional: False
   conditional_classes: 8
+  tau: 30.0
+  grad_factor: 2
 
 iterations: 200000
 batch_size: 64
@@ -72,7 +79,7 @@ warmup: 0
 
 ema_eval: True
 eval_batch_size: 32
-num_eval_samples: 100
+num_eval_samples: 1
 
 logfreq: 100
 evalfreq: 1000
@@ -85,7 +92,7 @@ hydra:
     subdir: ${hydra.job.num}
   launcher:
 #    max_num_timeout: 100000
-#    timeout_min: 4319
+    timeout_min: 4319
 #    partition: learnfair
     mem_gb: 64
 #    cpus_per_task: 10
