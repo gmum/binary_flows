@@ -323,14 +323,14 @@ def create_binary_flows_nets(bits=8, architecture='cnn', M=32, ks=3, pad=1, line
                                       LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
                                       LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
                                       LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
-                                      LogicLayer(in_dim=M, out_dim=4*(bits//2)*(img_shape[-1] * img_shape[-2]), grad_factor=grad_factor),
+                                      LogicLayer(in_dim=M, out_dim=32*(bits//2)*(img_shape[-1] * img_shape[-2]), grad_factor=grad_factor),
                                       GroupSum(k=(bits//2)*(img_shape[-1] * img_shape[-2]), tau=tau))
 
         net_b_no_linear_codes = lambda: nn.Sequential(LogicLayer(in_dim=(bits//2)*(img_shape[-1] * img_shape[-2]), out_dim=M, grad_factor=grad_factor),
                                                       LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
                                                       LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
                                                       LogicLayer(in_dim=M, out_dim=M, grad_factor=grad_factor),
-                                                      LogicLayer(in_dim=M, out_dim=4*(bits//2)*(img_shape[-1] * img_shape[-2]), grad_factor=grad_factor),
+                                                      LogicLayer(in_dim=M, out_dim=32*(bits//2)*(img_shape[-1] * img_shape[-2]), grad_factor=grad_factor),
                                                       GroupSum(k=(bits//2)*(img_shape[-1] * img_shape[-2]), tau=tau))
 
         if linear_codes:
